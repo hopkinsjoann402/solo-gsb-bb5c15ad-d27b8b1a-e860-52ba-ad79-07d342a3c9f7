@@ -36,27 +36,84 @@ docker compose up --build
 | `MAX_VERIFICATION_TTL_SECONDS` | `3600` | 验收令牌有效期上限（秒），缺省跟随 `MAX_LEASE_TTL_SECONDS` |
 | `DEFAULT_BASE_RETRY_SECONDS` | `5` | 创建会话未显式指定时的失败退避基数（秒） |
 | `DEFAULT_MAX_RETRY_SECONDS` | `300` | 创建会话未显式指定时的失败退避冷却上限（秒） |
+| `DEFAULT_RESERVATION_TTL_SECONDS` | `3600` | 容量预留默认有效期（秒），创建会话可用 `reservation_ttl_seconds` 覆盖 |
+| `MAX_RESERVATION_TTL_SECONDS` | `86400` | 容量预留有效期上限（秒），超出会被截断 |
 
 端口映射默认为宿主机 `8000` → 容器 `8000`，可在 `docker-compose.yml` 的 `ports` 中修改。
 
 ## 核心语义
 
-- **会话**：创建时登记 `total_chunks`（总分片数）与 `file_digest`（期望的完整文件摘要），分片序号从 `0` 开始。可选 `digest_algorithm`（默认 `sha256`，仅作记录；取 `sha256-merkle-v1` 时启用提交时的 Merkle 完整性校验）。可选失败退避参数 `base_retry_seconds`（默认 `5`，必须为正）与 `max_retry_seconds`（默认 `300`，必须为正且不小于 base）。
+- **租户容量预留**：创建会话必须提供 `tenant_id` 与 `declared_bytes`（声明的文件字节数）。租户须先通过 `PUT /tenants/{tenant_id}/quota` 设置硬配额（未设置的租户创建会话返回 `404`）。服务端在**同一 SQLite 写事务**内校验 `used + reserved + declared_bytes <= limit` 并写入容量预留，全部创建请求经同一写锁串行化，**并发创建不会超额**；配额不足返回 `409` 及当前 `limit` / `used` / `reserved` / `available` 快照。预留带 **TTL**（`reservation_ttl_seconds`，缺省/上限见配置表）：**到期未提交的预留自动释放**（任何配额相关操作进入临界区时惰性物化，无需后台任务）；会话**提交时预留原子转为已用量**（`used` 增加、`reserved` 减少，同事务）；预留已过期时才提交的，需重新通过硬配额校验方可计入。`GET /tenants/{tenant_id}/quota` 返回 `limit` / `used` / `reserved` / `available`；**降低配额不得小于当前 `used + reserved`**（否则 `409`）。`POST /sessions/{id}/cancel` 仅允许 `active` 会话：在同一事务内**原子释放预留并使全部现有租约失效**（`leased` 分片重置为 `pending`、令牌清除；待验收分片回到 `pending`、验收令牌删除），重复取消幂等；已提交会话不可取消（`409`）。fork 的新会话继承源会话的租户与声明字节，并在同一租户下重新校验配额、写入新预留。
+- **会话**：创建时登记 `total_chunks`（总分片数）与 `file_digest`（期望的完整文件摘要），分片序号从 `0` 开始。可选 `digest_algorithm`（默认 `sha256`，仅作记录；取 `sha256-merkle-v1` 时启用提交时的 Merkle 完整性校验）。可选失败退避参数 `base_retry_seconds`（默认 `5`，必须为正）与 `max_retry_seconds`（默认 `300`，必须为正且不小于 base）。会话状态机为 `active → finalized | cancelled`；`cancelled` 为终态，不可再领取租约、上报、提交或分支。
 - **依赖（可选）**：创建会话时可提交 `dependencies`（键与值均为分片序号），声明某分片领取租约前必须完成的前置分片。越界、自依赖、有环的依赖图会被拒绝（`422`）；不提供时保持无依赖的原有行为。
 - **租约**：同一分片同一时刻仅允许一个有效租约；租约过期后可被重新领取（令牌轮换）。前置分片未全部完成时领取返回 `409` 及按序缺失的 `missing_dependencies`；前置全部完成后无需额外操作即可领取。
 - **失败上报与退避重试（可选自动生效）**：`POST /sessions/{id}/chunks/{index}/fail` 必须携带该分片**当前有效租约的令牌**；校验通过后在同一事务内**原子清除租约、`failure_count` 加 1**，并将分片置于退避冷却中，第 n 次失败冷却 `min(max_retry_seconds, base_retry_seconds × 2^(n-1))` 秒（默认序列 5、10、20、40、80、160、300、300…）。冷却中的分片**单片与批量领取均跳过/拒绝**，`/ready` 单独列出 `cooling_chunks`；冷却结束后无需干预即可重新领取。令牌不匹配、租约已过期、分片已完成或会话已提交均返回 `409`。
 - **完成上报**：必须携带该分片**当前有效租约的令牌**与分片摘要；以相同令牌 + 相同摘要重复上报为幂等成功（返回 `idempotent_replay: true`），摘要不同则返回 `409`。完成后**清除退避冷却但保留 `failure_count`**。普通会话完成即 `completed`；**启用分片验收队列**的会话先进入 `awaiting_verification`（见下文「分片验收队列」）。
 - **完成纠错回退（reopen）**：`POST /sessions/{id}/chunks/{index}/reopen` 凭目标分片**完成时保留的租约令牌**与 `expected_digest`（完成时上报的摘要）发起，仅允许**未提交会话中已完成且凭据匹配**的分片。校验通过后服务端沿依赖图找出**全部传递下游**，在**同一事务**内将目标及下游重置为 `pending`：清除摘要、完成时间、有效租约与退避截止时间，**保留累计失败次数**；同时会话 `revision` 递增 1。响应中的 `affected_chunks` 按**（拓扑层级, 分片序号）**升序稳定排列（目标层级为 0，层级取受影响子图中的最长路径）。任一校验失败（会话已提交 / 分片未完成 / 凭据不匹配）返回 `409` 且**不产生任何部分回退**；整个回退与并发领取互斥，领取方不会看到中间状态。
-- **进度分支（fork）**：`POST /sessions/{id}/fork` 从一个 **`active`** 会话分叉出全新的上传会话，请求体包含 `expected_revision`（调用方认为源会话所处的修订号，不匹配返回 `409` 及 `current_revision`）、幂等键 `request_id` 与 `reuse_chunks`（要复用进度的分片序号列表，可为空）。仅当 `reuse_chunks` 中**每一项都已在源会话完成**（越界序号按未完成处理，响应以 `not_completed_chunks` 返回），且集合**包含这些分片的全部传递前置分片**（缺失项以 `missing_prerequisites` 升序返回）时才会创建；任一校验失败返回 `409` 且**不落库**。新会话复制源会话的**全部配置**（总分片数、文件摘要、摘要算法、并发上限、退避参数）与**完整依赖图**：复用分片的**摘要与完成时间**复制为 `completed`，其余分片初始化为 `pending`；**不复制**租约（令牌/过期时间）、退避冷却与累计失败次数。新会话 `revision` 从 0 开始、状态为 `active`，与源会话相互独立。**同一源会话 + 同一 `request_id` 的重放**（含仅顺序/重复不同的 `reuse_chunks`）返回**首次创建的新会话**（`200`、`idempotent_replay: true`）；相同键但 `expected_revision` 或 `reuse_chunks` 变化返回 `409`。已提交（`finalized`）的会话不可再分支。
+- **进度分支（fork）**：`POST /sessions/{id}/fork` 从一个 **`active`** 会话分叉出全新的上传会话，请求体包含 `expected_revision`（调用方认为源会话所处的修订号，不匹配返回 `409` 及 `current_revision`）、幂等键 `request_id` 与 `reuse_chunks`（要复用进度的分片序号列表，可为空）。仅当 `reuse_chunks` 中**每一项都已在源会话完成**（越界序号按未完成处理，响应以 `not_completed_chunks` 返回），且集合**包含这些分片的全部传递前置分片**（缺失项以 `missing_prerequisites` 升序返回）时才会创建；任一校验失败返回 `409` 且**不落库**。新会话复制源会话的**全部配置**（总分片数、文件摘要、摘要算法、并发上限、退避参数、**租户与声明字节**——fork 在同一租户配额下重新校验并写入新预留，配额不足返回 `409`）与**完整依赖图**：复用分片的**摘要与完成时间**复制为 `completed`，其余分片初始化为 `pending`；**不复制**租约（令牌/过期时间）、退避冷却与累计失败次数。新会话 `revision` 从 0 开始、状态为 `active`，与源会话相互独立。**同一源会话 + 同一 `request_id` 的重放**（含仅顺序/重复不同的 `reuse_chunks`）返回**首次创建的新会话**（`200`、`idempotent_replay: true`）；相同键但 `expected_revision` 或 `reuse_chunks` 变化返回 `409`。已提交（`finalized`）的会话不可再分支。
 - **会话级并发上限（可选）**：创建会话时可设置 `max_active_leases`，限制该会话**当前有效（未过期）租约**的总数。单片领取在槽位占满时返回 `409`；批量领取则原子地领取至多 `min(count, 剩余槽位, 可领取分片数)` 个租约。不设置（`null`）时保持原有不限并发的行为。
 - **批量领取**：`POST /sessions/{id}/leases/batch` 在**同一临界区**内完成资格计算与写入：仅从“未完成、无有效租约（过期租约视为空闲）、**不在退避冷却中**、前置已全部完成”的分片中，按分片序号升序领取，返回各分片独立令牌；并发请求之间不会重复分配、也不会突破并发上限。无可领取项时返回空列表及 `active` / `blocked` / `next_expiry` 汇总，其中 **`next_expiry` 取有效租约最早过期时间与各分片退避最早结束时间中的更早者**。
-- **跨会话公平调度**：`POST /dispatch/lease` 面向多个上传会话组成的调度队列，每次调用从候选会话中**轮转发一片分片租约**。请求携带 `queue_key`（队列标识）、`session_ids`（候选会话列表）与可选 `lease_ttl_seconds`。服务端将候选**去重后按（创建时间, id）稳定排序**，并按 `queue_key` 持久化**最近一次成功发放的会话**作为游标；每次请求在**同一写锁事务**内从游标之后的会话开始**循环扫描**，命中首个“存在可领取分片且仍有并发槽位”的会话后，发放其**序号最低**的可领取分片。资格判定完全复用既有规则：未完成、无有效租约（过期视为空闲）、不在退避冷却中、前置全部完成、会话未提交且未达 `max_active_leases`，因此并发请求**不会重复发放**。**成功后才把游标推进到被发放会话**，连续请求会在可用会话之间轮转；**无可发放项时不推进游标**，响应中 `granted` 为 `null`、`unavailable` 按扫描顺序列出各会话原因（`session_not_found` / `session_finalized` / `session_full` / `chunks_blocked_by_dependencies` / `chunks_in_backoff` / `chunks_leased` / `no_unfinished_chunks`）与各会话的 `next_retry_at`，顶层 `next_retry_at` 取其中最早者。游标所指会话不在本次候选中时，从排序首位重新开始扫描。
-- **提交**：仅当全部分片完成才允许提交，返回按分片序号升序汇总的清单；否则返回 `409` 及 `missing_chunks` 缺失分片列表。重复提交幂等返回同一清单。会话使用 `sha256-merkle-v1` 时，提交前先按分片序号构建 Merkle 树并与 `file_digest` 常量时间比较，不匹配返回 `409` 及 `computed_digest`，会话保持 `active`（见下文「完整性校验」）。
+- **跨会话公平调度**：`POST /dispatch/lease` 面向多个上传会话组成的调度队列，每次调用从候选会话中**轮转发一片分片租约**。请求携带 `queue_key`（队列标识）、`session_ids`（候选会话列表）与可选 `lease_ttl_seconds`。服务端将候选**去重后按（创建时间, id）稳定排序**，并按 `queue_key` 持久化**最近一次成功发放的会话**作为游标；每次请求在**同一写锁事务**内从游标之后的会话开始**循环扫描**，命中首个“存在可领取分片且仍有并发槽位”的会话后，发放其**序号最低**的可领取分片。资格判定完全复用既有规则：未完成、无有效租约（过期视为空闲）、不在退避冷却中、前置全部完成、会话未提交且未达 `max_active_leases`，因此并发请求**不会重复发放**。**成功后才把游标推进到被发放会话**，连续请求会在可用会话之间轮转；**无可发放项时不推进游标**，响应中 `granted` 为 `null`、`unavailable` 按扫描顺序列出各会话原因（`session_not_found` / `session_finalized` / `session_cancelled` / `session_full` / `chunks_blocked_by_dependencies` / `chunks_in_backoff` / `chunks_leased` / `no_unfinished_chunks`）与各会话的 `next_retry_at`，顶层 `next_retry_at` 取其中最早者。游标所指会话不在本次候选中时，从排序首位重新开始扫描。
+- **提交**：仅当全部分片完成才允许提交，返回按分片序号升序汇总的清单；否则返回 `409` 及 `missing_chunks` 缺失分片列表。重复提交幂等返回同一清单。提交成功的同一事务内，会话的**容量预留原子转为租户已用量**（`used` 增加、`reserved` 减少；预留已过期时需重新通过硬配额校验，不足则返回 `409` 且会话保持 `active`）。会话使用 `sha256-merkle-v1` 时，提交前先按分片序号构建 Merkle 树并与 `file_digest` 常量时间比较，不匹配返回 `409` 及 `computed_digest`，会话保持 `active`（见下文「完整性校验」）。
 - **交付凭证（delivery ticket，一次性清单领取）**：已 `finalized` 的会话可通过 `POST /sessions/{id}/delivery-tickets`（携带 `expires_in_seconds`，1～365 天）签发**一次性清单领取凭证**。服务端生成高强度随机令牌（`secrets.token_urlsafe(32)`），**明文令牌仅在签发响应中返回一次**；数据库内**只保存令牌的 SHA-256、所属会话、到期时间与状态**（`active` / `consumed` / `revoked`），明文遗失不可找回。同一会话可签发多张相互独立的凭证；`active`（未提交）会话不能签发（`409`）。
   - **兑换**：`POST /delivery-tickets/redeem` 携带 `token` 与调用方生成的幂等键 `request_id`，在**同一写事务**内依次校验**未消费、未撤销、未过期**，通过后原子地把凭证置为 `consumed` 并返回该会话**按分片序号升序的 manifest**（与 finalize 清单一致）及 `redeemed_at`。**并发的不同 `request_id` 只有一个成功**（其余 `409 already consumed`）；**同一 `request_id` 的重放（含并发重试）返回与首次完全相同的结果**——首次响应被原样持久化，即使此后凭证已过期或被撤销。已撤销（`409 revoked`）、已过期（`409 expired`）或已被其它 `request_id` 消费（`409 already consumed`）的凭证均不可领取；未知令牌返回 `404`。
   - **撤销**：`POST /delivery-tickets/revoke` 携带 `token`，将未消费凭证置为 `revoked`（**已消费凭证不可撤销**，返回 `409`；已过期但未消费的凭证仍可撤销）；对已撤销凭证重复撤销幂等成功（`already_revoked: true`）。撤销后任何兑换请求都返回 `409`。
 - **已提交清单差异（manifest diff）**：`POST /manifests/diff` 接收 `base_session_id` 与 `target_session_id`，仅比较两个 **finalized** 会话按分片序号排列的 `chunk_digest` 序列，返回**插入+删除次数之和最小**的编辑脚本（多解时**固定优先删除再插入**），连续同类操作合并为携带 base/target **半开区间**与对应摘要的区段——单处分片插入只产生一个 insert 区段，其后的相同分片仍归入 equal 区段，不会全部误报。会话不存在 `404`、未提交 `409`、任一清单超过 **2000** 项 `422`；两份清单完全一致时返回覆盖整个清单的**单个 equal 区段**（见下文「已提交清单差异」）。
 - 已完成的分片不可再领取租约；已提交的会话进入只读状态。
+
+## 租户配额与容量预留（curl）
+
+创建会话前必须先为租户设置硬配额；会话生命周期内的容量流转为
+**预留（reserved）→ 提交转用量（used）/ 取消或到期释放**。
+
+```bash
+# 1. 设置租户硬配额（首次创建返回 201，再次调用更新返回 200）
+curl -s -X PUT http://localhost:8000/tenants/team-a/quota \
+  -H 'Content-Type: application/json' -d '{"hard_limit_bytes": 1073741824}'
+# => {"tenant_id": "team-a", "limit_bytes": 1073741824,
+#     "used_bytes": 0, "reserved_bytes": 0, "available_bytes": 1073741824}
+
+# 2. 创建会话：必须提供 tenant_id 与 declared_bytes，可选 reservation_ttl_seconds
+SID=$(curl -s -X POST http://localhost:8000/sessions \
+  -H 'Content-Type: application/json' \
+  -d '{"total_chunks": 4, "file_digest": "<文件SHA256>",
+       "tenant_id": "team-a", "declared_bytes": 268435456,
+       "reservation_ttl_seconds": 7200}' \
+  | python3 -c 'import sys, json; print(json.load(sys.stdin)["id"])')
+# 创建响应含 reservation_expires_at；未设置配额的租户返回 404，
+# 配额不足返回 409 及当前 limit/used/reserved/available 快照
+
+# 3. 查询配额：reserved 增加 268435456，available 相应减少
+curl -s http://localhost:8000/tenants/team-a/quota
+# => {"limit_bytes": 1073741824, "used_bytes": 0,
+#     "reserved_bytes": 268435456, "available_bytes": 805306368, ...}
+
+# 4a. 正常上传并提交：预留在提交事务内原子转为已用量
+curl -s -X POST http://localhost:8000/sessions/$SID/finalize
+curl -s http://localhost:8000/tenants/team-a/quota
+# => {"used_bytes": 268435456, "reserved_bytes": 0, ...}
+
+# 4b. 或中途取消（仅 active 会话）：原子释放预留并使现有租约失效，重复取消幂等
+curl -s -X POST http://localhost:8000/sessions/$SID/cancel
+# => {"status": "cancelled", "released_bytes": 268435456,
+#     "invalidated_leases": 2, "idempotent_replay": false, ...}
+curl -s -X POST http://localhost:8000/sessions/$SID/cancel
+# => {"status": "cancelled", "released_bytes": 0, "invalidated_leases": 0,
+#     "idempotent_replay": true, ...}
+
+# 5. 预留 TTL 到期未提交：预留自动释放（无需后台任务，配额操作时惰性生效）；
+#    已过期预留的会话再提交时，需重新通过硬配额校验才会计入 used
+
+# 6. 调整配额：降低后的值不得小于当前 used + reserved，否则 409 并返回当前快照
+curl -s -X PUT http://localhost:8000/tenants/team-a/quota \
+  -H 'Content-Type: application/json' -d '{"hard_limit_bytes": 134217728}'
+# => 409 {"detail": "hard limit below used + reserved",
+#         "tenant_id": "team-a", "limit_bytes": 1073741824,
+#         "used_bytes": 268435456, "reserved_bytes": 0, "available_bytes": 805306368}
+```
+
+取消后的会话进入 `cancelled` 终态：领取租约、完成/失败上报、验收决定、reopen、提交、
+fork 均返回 `409`，跨会话调度将其报告为 `session_cancelled`；状态查询仍可读取。
 
 ## 分片验收队列（verification_required，可选）
 
@@ -122,9 +179,10 @@ pending --(领取上传租约)--> leased --(complete：令牌+摘要匹配)--> a
 
 ```bash
 # 1. 创建启用验收队列的会话并逐分片领取/上报完成（complete 返回 awaiting_verification）
+#    （前提：租户 demo 已设置配额，见「调用示例」第 0 步）
 SID=$(curl -s -X POST http://localhost:8000/sessions \
   -H 'Content-Type: application/json' \
-  -d '{"total_chunks": 2, "file_digest": "<文件摘要>", "verification_required": true}' \
+  -d '{"total_chunks": 2, "file_digest": "<文件摘要>", "verification_required": true, "tenant_id": "demo", "declared_bytes": 2097152}' \
   | python3 -c 'import sys, json; print(json.load(sys.stdin)["id"])')
 TOKEN=$(curl -s -X POST http://localhost:8000/sessions/$SID/chunks/0/lease \
   | python3 -c 'import sys, json; print(json.load(sys.stdin)["lease_token"])')
@@ -215,7 +273,8 @@ ROOT=$(python3 -c '...')   # 上述 merkle_root([d0, d1, d2, ...])
 SID=$(curl -s -X POST http://localhost:8000/sessions \
   -H 'Content-Type: application/json' \
   -d "{\"total_chunks\": 3, \"file_digest\": \"$ROOT\",
-       \"digest_algorithm\": \"sha256-merkle-v1\"}" \
+       \"digest_algorithm\": \"sha256-merkle-v1\",
+       \"tenant_id\": \"demo\", \"declared_bytes\": 3145728}" \
   | python3 -c 'import sys, json; print(json.load(sys.stdin)["id"])')
 
 # 3. 逐分片领取租约并上报完成；chunk_digest 必须是 64 位小写十六进制
@@ -236,9 +295,12 @@ curl -s -X POST http://localhost:8000/sessions/$SID/finalize
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
-| `POST` | `/sessions` | 创建上传会话（可选 `dependencies` 依赖图、`max_active_leases` 并发上限、`base_retry_seconds`/`max_retry_seconds` 退避参数、`verification_required` 分片验收队列） |
-| `GET` | `/sessions/{session_id}` | 查询会话与逐分片状态（含各分片 `dependencies`、`failure_count`、`retry_after`、退避参数、当前 `active_leases`、会话 `revision` 与 `source_session_id`） |
-| `POST` | `/sessions/{session_id}/fork` | 进度分支：从 active 会话创建新会话，复用已完成分片进度（校验修订号/完成状态/传递前置闭包，`request_id` 幂等） |
+| `POST` | `/sessions` | 创建上传会话（必须 `tenant_id` + `declared_bytes` 预留容量；可选 `dependencies` 依赖图、`max_active_leases` 并发上限、`base_retry_seconds`/`max_retry_seconds` 退避参数、`verification_required` 分片验收队列、`reservation_ttl_seconds` 预留 TTL） |
+| `GET` | `/sessions/{session_id}` | 查询会话与逐分片状态（含各分片 `dependencies`、`failure_count`、`retry_after`、退避参数、当前 `active_leases`、会话 `revision`、`source_session_id`、`tenant_id` 与 `declared_bytes`） |
+| `POST` | `/sessions/{session_id}/fork` | 进度分支：从 active 会话创建新会话，复用已完成分片进度（校验修订号/完成状态/传递前置闭包，`request_id` 幂等；继承租户并在其配额下重新预留） |
+| `POST` | `/sessions/{session_id}/cancel` | 取消 active 会话：原子释放容量预留并使全部现有租约失效（重复取消幂等；已提交返回 409） |
+| `PUT` | `/tenants/{tenant_id}/quota` | 设置租户硬配额（不存在则创建 201，否则更新 200）；降低配额不得小于 `used + reserved`（409 含当前快照） |
+| `GET` | `/tenants/{tenant_id}/quota` | 查询租户配额：`limit` / `used` / `reserved` / `available`（租户不存在 404） |
 | `GET` | `/sessions/{session_id}/ready` | 当前可领取的分片、被依赖阻塞的分片，以及退避冷却中的分片（`cooling_chunks`） |
 | `POST` | `/sessions/{session_id}/chunks/{index}/lease` | 领取分片租约（同样受 `max_active_leases` 与退避冷却约束） |
 | `POST` | `/sessions/{session_id}/leases/batch` | 原子批量领取租约（按分片序号，数量不超过 `count` 与剩余并发槽位；自动跳过冷却分片） |
@@ -261,7 +323,7 @@ curl -s -X POST http://localhost:8000/sessions/$SID/finalize
 # 1. 创建会话：8 个分片，同一时刻最多 3 个有效租约
 SID=$(curl -s -X POST http://localhost:8000/sessions \
   -H 'Content-Type: application/json' \
-  -d '{"total_chunks": 8, "file_digest": "<文件SHA256>", "max_active_leases": 3}' \
+  -d '{"total_chunks": 8, "file_digest": "<文件SHA256>", "max_active_leases": 3, "tenant_id": "demo", "declared_bytes": 8388608}' \
   | python3 -c 'import sys, json; print(json.load(sys.stdin)["id"])')
 
 # 2. 一次申请 5 个、TTL 120 秒：实际只发 3 个（受剩余并发槽位限制），按分片序号升序返回
@@ -304,7 +366,7 @@ curl -s http://localhost:8000/sessions/$SID
 连续请求在可用会话之间轮转。
 
 ```bash
-# 1. 三个会话（可以由不同客户端创建），各有若干分片
+# 1. 三个会话（可以由不同客户端创建，创建时均须携带 tenant_id/declared_bytes），各有若干分片
 A=<会话A的id>; B=<会话B的id>; C=<会话C的id>
 
 # 2. 首次调度：候选去重后按（创建时间, id）排序，从最早的会话开始发放最低序号分片
@@ -352,6 +414,7 @@ curl -s -X POST http://localhost:8000/dispatch/lease \
 # 5. 不可用原因一览：
 #    session_not_found                 会话不存在（不返回 4xx，按不可用项报告，排扫描序末尾）
 #    session_finalized                 会话已提交（只读）
+#    session_cancelled                 会话已取消（预留已释放，不再发放租约）
 #    session_full                      有可领取分片但有效租约已达 max_active_leases
 #    chunks_blocked_by_dependencies    未完成分片全部被未完成的前置阻塞
 #    chunks_in_backoff                 前置已完成的未完成分片全部处于失败退避冷却
@@ -370,10 +433,14 @@ curl -s -X POST http://localhost:8000/dispatch/lease \
 ## 调用示例（curl）
 
 ```bash
-# 1. 创建会话：4 个分片，登记期望的文件 SHA-256
+# 0. 先为租户设置硬配额（创建会话的前提；后续各示例均假设已执行本步）
+curl -s -X PUT http://localhost:8000/tenants/demo/quota \
+  -H 'Content-Type: application/json' -d '{"hard_limit_bytes": 1099511627776}'
+
+# 1. 创建会话：4 个分片，登记期望的文件 SHA-256，并声明文件字节数预留容量
 SID=$(curl -s -X POST http://localhost:8000/sessions \
   -H 'Content-Type: application/json' \
-  -d '{"total_chunks": 4, "file_digest": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855", "digest_algorithm": "sha256"}' \
+  -d '{"total_chunks": 4, "file_digest": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855", "digest_algorithm": "sha256", "tenant_id": "demo", "declared_bytes": 4194304}' \
   | python3 -c 'import sys, json; print(json.load(sys.stdin)["id"])')
 
 # 2. 领取分片 0 的租约（有效期 120 秒）
@@ -400,6 +467,7 @@ curl -s http://localhost:8000/sessions/$SID
 SID=$(curl -s -X POST http://localhost:8000/sessions \
   -H 'Content-Type: application/json' \
   -d '{"total_chunks": 4, "file_digest": "<文件SHA256>", "digest_algorithm": "sha256",
+       "tenant_id": "demo", "declared_bytes": 4194304,
        "dependencies": {"2": [0, 1], "3": [2]}}' \
   | python3 -c 'import sys, json; print(json.load(sys.stdin)["id"])')
 
@@ -431,6 +499,7 @@ curl -s http://localhost:8000/sessions/$SID
 SID=$(curl -s -X POST http://localhost:8000/sessions \
   -H 'Content-Type: application/json' \
   -d '{"total_chunks": 4, "file_digest": "<文件SHA256>",
+       "tenant_id": "demo", "declared_bytes": 4194304,
        "base_retry_seconds": 5, "max_retry_seconds": 300}' \
   | python3 -c 'import sys, json; print(json.load(sys.stdin)["id"])')
 
@@ -475,6 +544,7 @@ curl -s -X POST http://localhost:8000/sessions/$SID/chunks/0/complete \
 SID=$(curl -s -X POST http://localhost:8000/sessions \
   -H 'Content-Type: application/json' \
   -d '{"total_chunks": 4, "file_digest": "<文件SHA256>",
+       "tenant_id": "demo", "declared_bytes": 4194304,
        "dependencies": {"2": [0, 1], "3": [2]}}' \
   | python3 -c 'import sys, json; print(json.load(sys.stdin)["id"])')
 
@@ -710,7 +780,8 @@ app/
   db.py        # SQLite 连接与建库建表（启动时自动执行）
   schemas.py   # Pydantic 请求/响应模型
 tests/
-  test_api.py  # 租约独占/过期、幂等、提交、交付凭证、分片验收队列、清单差异等端到端行为测试
+  test_api.py  # 租约独占/过期、幂等、提交、交付凭证、分片验收队列、清单差异、
+               # 租户配额与容量预留、会话取消等端到端行为测试
 Dockerfile
 docker-compose.yml
 requirements.txt

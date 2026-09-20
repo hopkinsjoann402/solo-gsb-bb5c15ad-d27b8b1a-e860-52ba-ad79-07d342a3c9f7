@@ -68,6 +68,18 @@ class CreateSessionRequest(BaseModel):
         min_length=1, max_length=256,
         description="期望的完整文件摘要；digest_algorithm 为 sha256-merkle-v1 时必须是"
                     " 64 位小写十六进制（各分片摘要构建的 Merkle 根）")
+    tenant_id: str = Field(
+        min_length=1, max_length=128,
+        description="所属租户：必须已通过 PUT /tenants/{tenant_id}/quota 设置硬配额；"
+                    "创建会话在同一写事务内校验配额并按 declared_bytes 预留容量")
+    declared_bytes: int = Field(
+        ge=1, le=2**63 - 1,
+        description="声明的文件字节数：创建会话时按该值在租户配额内预留容量；"
+                    "会话提交时转为已用量，取消或预留到期未提交时释放")
+    reservation_ttl_seconds: Optional[int] = Field(
+        default=None, ge=1,
+        description="容量预留有效期（秒）：到期仍未提交的预留自动释放；"
+                    "缺省取服务端默认值，超过服务端上限会被截断")
     digest_algorithm: str = Field(
         default="sha256", min_length=1, max_length=32,
         description="摘要算法标识；取 sha256-merkle-v1 时启用 Merkle 完整性校验，"
@@ -126,6 +138,12 @@ class SessionResponse(BaseModel):
     file_digest: str
     digest_algorithm: str
     status: str
+    tenant_id: Optional[str] = Field(
+        default=None, description="所属租户；旧库迁移的会话为 null（不参与容量配额）")
+    declared_bytes: Optional[int] = Field(
+        default=None, description="创建会话时声明的文件字节数（容量预留依据）")
+    reservation_expires_at: Optional[datetime] = Field(
+        default=None, description="本次容量预留的到期时间；到期未提交将自动释放预留")
     source_session_id: Optional[str] = Field(
         default=None, description="fork 来源会话 id；原生会话为 null")
     max_active_leases: Optional[int] = Field(
@@ -209,6 +227,7 @@ class BatchLeaseResponse(BaseModel):
 # 跨会话调度中单个候选会话不可发放的原因：
 # - session_not_found：会话不存在
 # - session_finalized：会话已提交（只读，不再发放租约）
+# - session_cancelled：会话已取消（预留已释放，不再发放租约）
 # - session_full：存在可领取资格的分片，但会话当前有效租约数已达 max_active_leases
 # - chunks_blocked_by_dependencies：仍有未完成分片，但全部被未完成的前置依赖阻塞
 # - chunks_in_backoff：仍有未完成、前置已完成的分片，但全部处于失败退避冷却中
@@ -217,6 +236,7 @@ class BatchLeaseResponse(BaseModel):
 # - no_unfinished_chunks：全部分片已完成（无活可干）
 DISPATCH_REASON_SESSION_NOT_FOUND = "session_not_found"
 DISPATCH_REASON_SESSION_FINALIZED = "session_finalized"
+DISPATCH_REASON_SESSION_CANCELLED = "session_cancelled"
 DISPATCH_REASON_SESSION_FULL = "session_full"
 DISPATCH_REASON_BLOCKED = "chunks_blocked_by_dependencies"
 DISPATCH_REASON_BACKOFF = "chunks_in_backoff"
@@ -257,9 +277,9 @@ class DispatchUnavailableSession(BaseModel):
         default=None,
         description="不可发放的候选会话 id；候选中存在无法识别的空值时可能为 null")
     reason: str = Field(
-        description="不可发放原因：session_not_found / session_finalized / session_full /"
-                    " chunks_blocked_by_dependencies / chunks_in_backoff / chunks_leased /"
-                    " chunks_awaiting_verification / no_unfinished_chunks")
+        description="不可发放原因：session_not_found / session_finalized / session_cancelled /"
+                    " session_full / chunks_blocked_by_dependencies / chunks_in_backoff /"
+                    " chunks_leased / chunks_awaiting_verification / no_unfinished_chunks")
     detail: Optional[str] = Field(
         default=None, description="原因的可读说明")
     next_retry_at: Optional[datetime] = Field(
@@ -364,6 +384,10 @@ class ForkSessionResponse(BaseModel):
     file_digest: str
     digest_algorithm: str
     status: str = Field(description="新会话状态：始终为 active")
+    tenant_id: Optional[str] = Field(
+        default=None, description="从源会话继承的租户；新会话在同一租户下重新预留容量")
+    declared_bytes: Optional[int] = Field(
+        default=None, description="从源会话继承的声明字节数")
     revision: int = Field(description="新会话修订号：从 0 开始")
     reused_chunks: list[int] = Field(
         description="复制为 completed 的分片序号（升序去重，即请求中的 reuse_chunks）")
@@ -507,12 +531,16 @@ class ReadyResponse(BaseModel):
 
 class SessionStatusResponse(BaseModel):
     id: str
-    status: str
+    status: str = Field(description="会话状态：active | finalized | cancelled")
     total_chunks: int
     completed_chunks: int
     missing_chunks: list[int]
     file_digest: str
     digest_algorithm: str
+    tenant_id: Optional[str] = Field(
+        default=None, description="所属租户；旧库迁移的会话为 null（不参与容量配额）")
+    declared_bytes: Optional[int] = Field(
+        default=None, description="创建会话时声明的文件字节数（容量预留依据）")
     source_session_id: Optional[str] = Field(
         default=None, description="fork 来源会话 id；原生会话为 null")
     revision: int = Field(
@@ -638,3 +666,43 @@ class ManifestDiffResponse(BaseModel):
     segments: list[ManifestDiffSegment] = Field(
         description="按清单顺序排列的合并区段：连续同类操作已合并；多解时固定优先删除再插入，"
                     "同一替换位置的 delete 区段总是排在 insert 区段之前")
+
+
+# ---------------------------------------------------------------- 租户配额与容量预留
+
+# 容量预留状态：active（占用中）| committed（会话提交，已转为已用量）
+# | released（会话取消，已释放）| expired（TTL 到期未提交，已释放）
+RESERVATION_STATE_ACTIVE = "active"
+RESERVATION_STATE_COMMITTED = "committed"
+RESERVATION_STATE_RELEASED = "released"
+RESERVATION_STATE_EXPIRED = "expired"
+
+
+class TenantQuotaPutRequest(BaseModel):
+    hard_limit_bytes: int = Field(
+        ge=0, le=2**63 - 1,
+        description="租户硬配额（字节）：used + reserved 不得突破该上限；"
+                    "降低配额时不得小于当前 used + reserved，否则返回 409")
+
+
+class TenantQuotaResponse(BaseModel):
+    tenant_id: str
+    limit_bytes: int = Field(description="租户硬配额（字节）")
+    used_bytes: int = Field(description="已用量：已提交会话的累计声明字节")
+    reserved_bytes: int = Field(
+        description="预留中：全部未过期 active 预留的字节合计（到期未提交的预留已释放，不计入）")
+    available_bytes: int = Field(
+        description="剩余可用 = limit - used - reserved；创建会话的 declared_bytes 不得超过该值")
+
+
+class CancelSessionResponse(BaseModel):
+    session_id: str
+    status: str = Field(description="取消后的会话状态：cancelled")
+    cancelled_at: datetime = Field(description="会话取消时间（幂等重放保持首次值）")
+    released_bytes: int = Field(
+        description="本次取消释放的预留字节数；预留已到期释放或重复取消时为 0")
+    invalidated_leases: int = Field(
+        description="本次取消失效的租约数：leased 分片的上传租约（重置为 pending 并清除令牌）"
+                    "与待验收分片的验收令牌（分片回到 pending、令牌删除）之和；重复取消时为 0")
+    idempotent_replay: bool = Field(
+        default=False, description="是否为重复取消的幂等重放（会话此前已处于 cancelled）")

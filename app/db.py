@@ -26,8 +26,11 @@ CREATE TABLE IF NOT EXISTS sessions (
     revision               INTEGER NOT NULL DEFAULT 0,       -- 修订号：每次成功 reopen 回退递增 1
     source_session_id      TEXT,                             -- fork 来源会话；NULL 表示原生会话
     verification_required  INTEGER NOT NULL DEFAULT 0,       -- 分片验收队列：1=启用，完成先进入待验收
+    tenant_id              TEXT,                             -- 所属租户（容量预留）；旧库迁移数据为 NULL
+    declared_bytes         INTEGER,                          -- 创建会话时声明的文件字节数（预留依据）
     created_at             TEXT NOT NULL,
-    finalized_at           TEXT
+    finalized_at           TEXT,
+    cancelled_at           TEXT                            -- 取消时间；仅 cancelled 会话非空
 );
 
 -- 进度分支幂等记录：(源会话, request_id) 唯一，重放返回首次创建的新会话
@@ -127,6 +130,34 @@ CREATE TABLE IF NOT EXISTS delivery_ticket_redemptions (
     created_at    TEXT NOT NULL,
     PRIMARY KEY (token_hash, request_id)
 );
+
+-- 租户硬配额：hard_limit_bytes 为硬上限（used + reserved 不得突破）；
+-- used_bytes 为已提交会话的累计字节（持久计数器，finalize 时原子累加）；
+-- reserved（预留中字节）不落库，由 capacity_reservations 中 active 行实时汇总
+CREATE TABLE IF NOT EXISTS tenants (
+    tenant_id        TEXT PRIMARY KEY,
+    hard_limit_bytes INTEGER NOT NULL,
+    used_bytes       INTEGER NOT NULL DEFAULT 0,
+    created_at       TEXT NOT NULL,
+    updated_at       TEXT NOT NULL
+);
+
+-- 容量预留：每个会话至多一行（创建会话时与会话同事务写入）。
+-- 状态机：active（占用中）→ committed（会话提交，预留原子转为已用量）
+--                       → released（会话取消，预留释放）
+--                       → expired（TTL 到期未提交，惰性释放：临界区内物化）
+CREATE TABLE IF NOT EXISTS capacity_reservations (
+    session_id  TEXT PRIMARY KEY REFERENCES sessions(id),
+    tenant_id   TEXT NOT NULL,
+    bytes       INTEGER NOT NULL,
+    state       TEXT NOT NULL DEFAULT 'active',  -- active | committed | released | expired
+    created_at  TEXT NOT NULL,
+    expires_at  TEXT NOT NULL,
+    closed_at   TEXT                             -- 转为 committed/released/expired 的时间
+);
+
+CREATE INDEX IF NOT EXISTS idx_capacity_reservations_tenant
+    ON capacity_reservations(tenant_id, state);
 """
 
 # 增量迁移：针对早于当前 SCHEMA 创建的旧库，幂等执行（CREATE TABLE IF NOT EXISTS
@@ -263,6 +294,53 @@ CREATE TABLE verification_decisions (
     decision      TEXT NOT NULL,
     decided_at    TEXT NOT NULL,
     FOREIGN KEY (session_id, chunk_index) REFERENCES chunks(session_id, chunk_index)
+)
+        """,
+    ),
+    # 0013: 租户容量预留：会话所属租户与声明字节数；旧库既有会话为 NULL（不参与配额体系）
+    (
+        "column",
+        "sessions.tenant_id",
+        "ALTER TABLE sessions ADD COLUMN tenant_id TEXT",
+    ),
+    (
+        "column",
+        "sessions.declared_bytes",
+        "ALTER TABLE sessions ADD COLUMN declared_bytes INTEGER",
+    ),
+    # 0014: 会话取消时间；仅 cancelled 会话非空，既有会话为 NULL
+    (
+        "column",
+        "sessions.cancelled_at",
+        "ALTER TABLE sessions ADD COLUMN cancelled_at TEXT",
+    ),
+    # 0015: 租户硬配额表；旧库直接按当前定义新建，租户须先设置配额才能创建会话
+    (
+        "table",
+        "tenants",
+        """
+CREATE TABLE tenants (
+    tenant_id        TEXT PRIMARY KEY,
+    hard_limit_bytes INTEGER NOT NULL,
+    used_bytes       INTEGER NOT NULL DEFAULT 0,
+    created_at       TEXT NOT NULL,
+    updated_at       TEXT NOT NULL
+)
+        """,
+    ),
+    # 0016: 容量预留表；旧库直接按当前定义新建，每个会话至多一行
+    (
+        "table",
+        "capacity_reservations",
+        """
+CREATE TABLE capacity_reservations (
+    session_id  TEXT PRIMARY KEY REFERENCES sessions(id),
+    tenant_id   TEXT NOT NULL,
+    bytes       INTEGER NOT NULL,
+    state       TEXT NOT NULL DEFAULT 'active',
+    created_at  TEXT NOT NULL,
+    expires_at  TEXT NOT NULL,
+    closed_at   TEXT
 )
         """,
     ),

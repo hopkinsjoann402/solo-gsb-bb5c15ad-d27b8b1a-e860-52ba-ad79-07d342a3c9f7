@@ -3,6 +3,7 @@ import hashlib
 import os
 import tempfile
 import threading
+import uuid
 from datetime import datetime, timezone
 
 import pytest
@@ -17,6 +18,36 @@ from app.db import get_conn  # noqa: E402
 from app.main import app  # noqa: E402
 
 client = TestClient(app)
+
+# 创建会话必须提供 tenant_id 与 declared_bytes：为聚焦其它行为的既有用例自动注入
+# 一个独享租户（配额足够大，用例之间互不影响）；显式给出 tenant_id/declared_bytes
+# 的请求原样发送。需要验证“缺省字段被拒绝”的用例请使用 _raw_post。
+_raw_post = client.post
+TENANT_QUOTA_BYTES = 10**15
+
+
+def _ensure_tenant(tenant_id, quota=TENANT_QUOTA_BYTES):
+    resp = client.put(
+        f"/tenants/{tenant_id}/quota", json={"hard_limit_bytes": quota})
+    assert resp.status_code in (200, 201), resp.text
+
+
+def _inject_tenant(payload):
+    payload = dict(payload)
+    if "tenant_id" not in payload:
+        payload["tenant_id"] = "tenant-" + uuid.uuid4().hex[:12]
+        _ensure_tenant(payload["tenant_id"])
+    payload.setdefault("declared_bytes", 1000)
+    return payload
+
+
+def _post(url, **kwargs):
+    if url == "/sessions" and isinstance(kwargs.get("json"), dict):
+        kwargs["json"] = _inject_tenant(kwargs["json"])
+    return _raw_post(url, **kwargs)
+
+
+client.post = _post
 
 
 def make_session(total_chunks=3, file_digest="f" * 64):
@@ -3295,3 +3326,476 @@ def test_manifest_diff_allows_exactly_2000_items():
     delete = body["segments"][1]
     assert (delete["base_start"], delete["base_end"]) == (1, 1999)
     assert len(delete["base_digests"]) == 1998
+
+
+# ---------------------------------------------------------------- 租户配额与容量预留
+
+RESERVATION_PAST = "2000-01-01T00:00:00+00:00"
+
+
+def new_tenant(quota=10**6):
+    """创建带硬配额的租户，返回 tenant_id。"""
+    tenant_id = "tenant-" + uuid.uuid4().hex[:12]
+    _ensure_tenant(tenant_id, quota)
+    return tenant_id
+
+
+def create_session_in_tenant(tenant_id, declared_bytes=100, total_chunks=2, **extra):
+    payload = {
+        "total_chunks": total_chunks,
+        "file_digest": "f" * 64,
+        "digest_algorithm": "sha256",
+        "tenant_id": tenant_id,
+        "declared_bytes": declared_bytes,
+        **extra,
+    }
+    return client.post("/sessions", json=payload)
+
+
+def quota_of(tenant_id):
+    resp = client.get(f"/tenants/{tenant_id}/quota")
+    assert resp.status_code == 200, resp.text
+    return resp.json()
+
+
+def expire_reservation(session_id, when=RESERVATION_PAST):
+    """直接把会话的容量预留置为到期，避免真实等待。"""
+    get_conn().execute(
+        "UPDATE capacity_reservations SET expires_at = ? WHERE session_id = ?",
+        (when, session_id),
+    )
+    get_conn().commit()
+
+
+def reservation_row(session_id):
+    return get_conn().execute(
+        "SELECT * FROM capacity_reservations WHERE session_id = ?",
+        (session_id,),
+    ).fetchone()
+
+
+def test_tenant_quota_put_create_then_update_and_get():
+    tenant_id = "tenant-" + uuid.uuid4().hex[:12]
+    # 未设置配额的租户查询返回 404
+    assert client.get(f"/tenants/{tenant_id}/quota").status_code == 404
+
+    # 首次设置：创建租户（201），用量与预留均为 0
+    r1 = client.put(f"/tenants/{tenant_id}/quota", json={"hard_limit_bytes": 5000})
+    assert r1.status_code == 201, r1.text
+    assert r1.json() == {
+        "tenant_id": tenant_id,
+        "limit_bytes": 5000,
+        "used_bytes": 0,
+        "reserved_bytes": 0,
+        "available_bytes": 5000,
+    }
+
+    # 再次设置：更新既有租户（200）
+    r2 = client.put(f"/tenants/{tenant_id}/quota", json={"hard_limit_bytes": 8000})
+    assert r2.status_code == 200, r2.text
+    assert r2.json()["limit_bytes"] == 8000
+    assert r2.json()["available_bytes"] == 8000
+
+    # 查询与设置口径一致
+    assert quota_of(tenant_id) == r2.json()
+
+
+def test_tenant_quota_request_validation():
+    tenant_id = new_tenant()
+    assert client.put(
+        f"/tenants/{tenant_id}/quota", json={"hard_limit_bytes": -1}
+    ).status_code == 422
+    assert client.put(f"/tenants/{tenant_id}/quota", json={}).status_code == 422
+
+
+def test_create_session_requires_tenant_id_and_declared_bytes():
+    # 缺少 tenant_id / declared_bytes 均为 422（用 _raw_post 绕过测试注入）
+    assert _raw_post("/sessions", json={
+        "total_chunks": 1, "file_digest": "x",
+    }).status_code == 422
+    assert _raw_post("/sessions", json={
+        "total_chunks": 1, "file_digest": "x", "tenant_id": "t",
+    }).status_code == 422
+    assert _raw_post("/sessions", json={
+        "total_chunks": 1, "file_digest": "x", "declared_bytes": 100,
+    }).status_code == 422
+    # declared_bytes 必须为正
+    tenant_id = new_tenant()
+    assert _raw_post("/sessions", json={
+        "total_chunks": 1, "file_digest": "x",
+        "tenant_id": tenant_id, "declared_bytes": 0,
+    }).status_code == 422
+
+
+def test_create_session_unknown_tenant_returns_404():
+    resp = _raw_post("/sessions", json={
+        "total_chunks": 1, "file_digest": "x",
+        "tenant_id": "no-such-tenant", "declared_bytes": 100,
+    })
+    assert resp.status_code == 404
+    assert resp.json()["detail"] == "tenant not found"
+
+
+def test_create_session_reserves_capacity_and_exposes_fields():
+    tenant_id = new_tenant(quota=10_000)
+    resp = create_session_in_tenant(tenant_id, declared_bytes=700)
+    assert resp.status_code == 201, resp.text
+    body = resp.json()
+    assert body["tenant_id"] == tenant_id
+    assert body["declared_bytes"] == 700
+    assert body["reservation_expires_at"] is not None
+
+    quota = quota_of(tenant_id)
+    assert quota["used_bytes"] == 0
+    assert quota["reserved_bytes"] == 700
+    assert quota["available_bytes"] == 10_000 - 700
+
+    # 会话状态接口同样暴露租户与声明字节
+    st = client.get(f"/sessions/{body['id']}").json()
+    assert st["tenant_id"] == tenant_id
+    assert st["declared_bytes"] == 700
+
+
+def test_create_session_quota_exceeded_returns_409_with_snapshot():
+    tenant_id = new_tenant(quota=1000)
+    assert create_session_in_tenant(tenant_id, 600).status_code == 201
+
+    resp = create_session_in_tenant(tenant_id, 500)
+    assert resp.status_code == 409, resp.text
+    body = resp.json()
+    assert body["detail"] == "tenant quota exceeded"
+    assert body["limit_bytes"] == 1000
+    assert body["used_bytes"] == 0
+    assert body["reserved_bytes"] == 600
+    assert body["available_bytes"] == 400
+
+    # 边界：恰好等于 available 可以创建
+    assert create_session_in_tenant(tenant_id, 400).status_code == 201
+    assert quota_of(tenant_id)["available_bytes"] == 0
+    # 再超 1 字节即拒绝
+    assert create_session_in_tenant(tenant_id, 1).status_code == 409
+
+
+def test_concurrent_create_never_exceeds_quota():
+    tenant_id = new_tenant(quota=1000)
+    barrier = threading.Barrier(20)
+    results = []
+    lock = threading.Lock()
+
+    def worker():
+        barrier.wait()
+        resp = create_session_in_tenant(tenant_id, 100, total_chunks=1)
+        with lock:
+            results.append(resp.status_code)
+
+    threads = [threading.Thread(target=worker) for _ in range(20)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    # 20 个并发请求各预留 100 字节、硬配额 1000：恰好 10 个成功，其余 409
+    assert results.count(201) == 10
+    assert results.count(409) == 10
+    quota = quota_of(tenant_id)
+    assert quota["reserved_bytes"] == 1000
+    assert quota["available_bytes"] == 0
+
+
+def test_reservation_ttl_applied_and_capped():
+    tenant_id = new_tenant()
+    # 显式 TTL：到期时间约为创建后 600 秒
+    resp = create_session_in_tenant(tenant_id, 100, reservation_ttl_seconds=600)
+    assert resp.status_code == 201, resp.text
+    body = resp.json()
+    created = datetime.fromisoformat(body["created_at"])
+    expires = datetime.fromisoformat(body["reservation_expires_at"])
+    delta = (expires - created).total_seconds()
+    assert 590 <= delta <= 610
+
+    # 超过服务端上限（默认 86400）被截断
+    resp2 = create_session_in_tenant(tenant_id, 100, reservation_ttl_seconds=10**9)
+    assert resp2.status_code == 201, resp2.text
+    body2 = resp2.json()
+    delta2 = (
+        datetime.fromisoformat(body2["reservation_expires_at"])
+        - datetime.fromisoformat(body2["created_at"])
+    ).total_seconds()
+    assert delta2 <= 86400
+
+
+def test_expired_reservation_is_released_lazily():
+    tenant_id = new_tenant(quota=1000)
+    session = create_session_in_tenant(tenant_id, 600).json()
+    assert quota_of(tenant_id)["reserved_bytes"] == 600
+
+    # 预留到期后：查询配额时惰性释放，reserved 归零、available 恢复
+    expire_reservation(session["id"])
+    quota = quota_of(tenant_id)
+    assert quota["reserved_bytes"] == 0
+    assert quota["available_bytes"] == 1000
+    # 物化为 expired 状态（非简单读时过滤）
+    assert reservation_row(session["id"])["state"] == "expired"
+
+
+def test_finalize_converts_reservation_to_used_atomically():
+    tenant_id = new_tenant(quota=1000)
+    session = create_session_in_tenant(tenant_id, 600, total_chunks=2).json()
+    for index in range(2):
+        token = lease(session["id"], index).json()["lease_token"]
+        assert complete(session["id"], index, token, "a" * 64).status_code == 200
+
+    fin = client.post(f"/sessions/{session['id']}/finalize")
+    assert fin.status_code == 200, fin.text
+
+    # 预留原子转为已用量：reserved 归零、used 增加、available 不变
+    quota = quota_of(tenant_id)
+    assert quota["used_bytes"] == 600
+    assert quota["reserved_bytes"] == 0
+    assert quota["available_bytes"] == 400
+    assert reservation_row(session["id"])["state"] == "committed"
+
+    # 重复 finalize 幂等：used 不重复累加
+    fin2 = client.post(f"/sessions/{session['id']}/finalize")
+    assert fin2.status_code == 200
+    assert quota_of(tenant_id)["used_bytes"] == 600
+
+
+def test_finalize_with_expired_reservation_revalidates_quota():
+    tenant_id = new_tenant(quota=1000)
+    # 会话 A 预留 600 后到期释放；会话 B 随即占走 600
+    a = create_session_in_tenant(tenant_id, 600, total_chunks=1).json()
+    expire_reservation(a["id"])
+    b = create_session_in_tenant(tenant_id, 600, total_chunks=1)
+    assert b.status_code == 201
+
+    # A 的分片正常完成，但提交时预留已过期且配额被 B 占满 -> 409
+    token = lease(a["id"], 0).json()["lease_token"]
+    assert complete(a["id"], 0, token, "a" * 64).status_code == 200
+    fin = client.post(f"/sessions/{a['id']}/finalize")
+    assert fin.status_code == 409, fin.text
+    assert fin.json()["detail"] == "tenant quota exceeded"
+    # 会话保持 active，可稍后重试
+    assert client.get(f"/sessions/{a['id']}").json()["status"] == "active"
+
+    # 取消 B 释放预留后，A 重新提交成功：过期预留重新校验通过并转为已用量
+    cancel_b = client.post(f"/sessions/{b.json()['id']}/cancel")
+    assert cancel_b.status_code == 200
+    fin2 = client.post(f"/sessions/{a['id']}/finalize")
+    assert fin2.status_code == 200, fin2.text
+    quota = quota_of(tenant_id)
+    assert quota["used_bytes"] == 600
+    assert quota["reserved_bytes"] == 0
+    assert reservation_row(a["id"])["state"] == "committed"
+
+
+def test_cancel_releases_reservation_and_invalidates_leases():
+    tenant_id = new_tenant(quota=1000)
+    session = create_session_in_tenant(tenant_id, 600, total_chunks=3).json()
+    sid = session["id"]
+    token0 = lease(sid, 0).json()["lease_token"]
+    lease(sid, 1)
+
+    resp = client.post(f"/sessions/{sid}/cancel")
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["status"] == "cancelled"
+    assert body["released_bytes"] == 600
+    assert body["invalidated_leases"] == 2
+    assert body["idempotent_replay"] is False
+
+    # 预留已释放；会话为 cancelled 终态；租约已失效（分片回到 pending、令牌清除）
+    assert quota_of(tenant_id)["reserved_bytes"] == 0
+    st = client.get(f"/sessions/{sid}").json()
+    assert st["status"] == "cancelled"
+    assert [c["status"] for c in st["chunks"]] == ["pending"] * 3
+    assert reservation_row(sid)["state"] == "released"
+
+    # 取消后的会话不可再领取、上报、提交或分支
+    assert lease(sid, 2).status_code == 409
+    assert complete(sid, 0, token0, "a" * 64).status_code == 409
+    assert client.post(f"/sessions/{sid}/finalize").status_code == 409
+    fork = client.post(f"/sessions/{sid}/fork", json={
+        "expected_revision": 0, "request_id": "fork-after-cancel", "reuse_chunks": [],
+    })
+    assert fork.status_code == 409
+
+    # 重复取消幂等：不再释放、不再失效租约，cancelled_at 保持首次值
+    again = client.post(f"/sessions/{sid}/cancel")
+    assert again.status_code == 200, again.text
+    assert again.json()["idempotent_replay"] is True
+    assert again.json()["released_bytes"] == 0
+    assert again.json()["invalidated_leases"] == 0
+    assert again.json()["cancelled_at"] == body["cancelled_at"]
+
+
+def test_cancel_finalized_or_unknown_session():
+    # 已提交会话不可取消
+    sid = make_finalized_session(["a" * 64])
+    assert client.post(f"/sessions/{sid}/cancel").status_code == 409
+    # 未知会话 404
+    assert client.post("/sessions/no-such-session/cancel").status_code == 404
+
+
+def test_cancelled_session_is_not_dispatchable():
+    tenant_id = new_tenant()
+    session = create_session_in_tenant(tenant_id, 100, total_chunks=1).json()
+    assert client.post(f"/sessions/{session['id']}/cancel").status_code == 200
+
+    resp = client.post("/dispatch/lease", json={
+        "queue_key": "q-cancelled-" + uuid.uuid4().hex[:8],
+        "session_ids": [session["id"]],
+    })
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["granted"] is None
+    assert body["unavailable"][0]["reason"] == "session_cancelled"
+
+
+def test_lower_quota_below_used_plus_reserved_returns_409():
+    tenant_id = new_tenant(quota=1000)
+    session = create_session_in_tenant(tenant_id, 600, total_chunks=1).json()
+
+    # 预留 600 占用中：配额不得低于 reserved
+    resp = client.put(f"/tenants/{tenant_id}/quota", json={"hard_limit_bytes": 500})
+    assert resp.status_code == 409, resp.text
+    body = resp.json()
+    assert body["detail"] == "hard limit below used + reserved"
+    assert body["reserved_bytes"] == 600
+    # 恰好等于 used + reserved 允许
+    assert client.put(
+        f"/tenants/{tenant_id}/quota", json={"hard_limit_bytes": 600}
+    ).status_code == 200
+
+    # 提交后转为 used：配额同样不得低于 used
+    token = lease(session["id"], 0).json()["lease_token"]
+    assert complete(session["id"], 0, token, "a" * 64).status_code == 200
+    assert client.post(f"/sessions/{session['id']}/finalize").status_code == 200
+    assert client.put(
+        f"/tenants/{tenant_id}/quota", json={"hard_limit_bytes": 500}
+    ).status_code == 409
+    ok = client.put(f"/tenants/{tenant_id}/quota", json={"hard_limit_bytes": 700})
+    assert ok.status_code == 200
+    assert ok.json()["used_bytes"] == 600
+    assert ok.json()["available_bytes"] == 100
+
+
+def test_fork_inherits_tenant_and_reserves_capacity():
+    tenant_id = new_tenant(quota=2000)
+    source = create_session_in_tenant(tenant_id, 600, total_chunks=2).json()
+    token = lease(source["id"], 0).json()["lease_token"]
+    assert complete(source["id"], 0, token, "a" * 64).status_code == 200
+
+    # fork 继承租户与声明字节，在同一租户下再预留 600
+    fork = client.post(f"/sessions/{source['id']}/fork", json={
+        "expected_revision": 0, "request_id": "fork-quota-1", "reuse_chunks": [0],
+    })
+    assert fork.status_code == 201, fork.text
+    assert fork.json()["tenant_id"] == tenant_id
+    assert fork.json()["declared_bytes"] == 600
+    quota = quota_of(tenant_id)
+    assert quota["reserved_bytes"] == 1200
+    assert quota["available_bytes"] == 800
+
+    # 配额不足时 fork 被拒绝（409）且不落库
+    tenant2 = new_tenant(quota=700)
+    source2 = create_session_in_tenant(tenant2, 600, total_chunks=1).json()
+    fork2 = client.post(f"/sessions/{source2['id']}/fork", json={
+        "expected_revision": 0, "request_id": "fork-quota-2", "reuse_chunks": [],
+    })
+    assert fork2.status_code == 409, fork2.text
+    assert fork2.json()["detail"] == "tenant quota exceeded"
+    assert quota_of(tenant2)["reserved_bytes"] == 600
+
+
+def test_migration_adds_tenant_tables_to_legacy_database(tmp_path):
+    import sqlite3
+
+    legacy = tmp_path / "legacy_tenant.db"
+    conn = sqlite3.connect(legacy)
+    # 租户容量预留特性之前的旧 SCHEMA：sessions 无租户列，无配额/预留表
+    conn.executescript(
+        """
+        CREATE TABLE sessions (
+            id TEXT PRIMARY KEY, total_chunks INTEGER NOT NULL,
+            file_digest TEXT NOT NULL, digest_algorithm TEXT NOT NULL DEFAULT 'sha256',
+            status TEXT NOT NULL DEFAULT 'active', max_active_leases INTEGER,
+            base_retry_seconds INTEGER NOT NULL DEFAULT 5,
+            max_retry_seconds INTEGER NOT NULL DEFAULT 300,
+            revision INTEGER NOT NULL DEFAULT 0,
+            source_session_id TEXT, verification_required INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL, finalized_at TEXT
+        );
+        CREATE TABLE chunks (
+            session_id TEXT NOT NULL, chunk_index INTEGER NOT NULL,
+            status TEXT NOT NULL DEFAULT 'pending', lease_token TEXT,
+            lease_expires_at TEXT, chunk_digest TEXT, completed_at TEXT,
+            failure_count INTEGER NOT NULL DEFAULT 0, backoff_until TEXT,
+            PRIMARY KEY (session_id, chunk_index)
+        );
+        """
+    )
+    conn.execute(
+        "INSERT INTO sessions (id, total_chunks, file_digest, created_at)"
+        " VALUES ('legacy-s', 1, 'dig', '2026-01-01T00:00:00+00:00')"
+    )
+    conn.commit()
+    conn.close()
+
+    import app.db as db
+
+    migrated = sqlite3.connect(legacy)
+    db.run_migrations(migrated)
+    tables = {r[0] for r in migrated.execute(
+        "SELECT name FROM sqlite_master WHERE type = 'table'").fetchall()}
+    assert "tenants" in tables
+    assert "capacity_reservations" in tables
+
+    session_cols = {r[1] for r in migrated.execute(
+        "PRAGMA table_info(sessions)").fetchall()}
+    assert {"tenant_id", "declared_bytes", "cancelled_at"} <= session_cols
+    # 旧会话的租户字段为 NULL：不参与配额体系
+    row = migrated.execute(
+        "SELECT tenant_id, declared_bytes, cancelled_at FROM sessions"
+        " WHERE id = 'legacy-s'"
+    ).fetchone()
+    assert row == (None, None, None)
+
+    tenant_cols = {r[1] for r in migrated.execute(
+        "PRAGMA table_info(tenants)").fetchall()}
+    assert tenant_cols == {
+        "tenant_id", "hard_limit_bytes", "used_bytes", "created_at", "updated_at"}
+    reservation_cols = {r[1] for r in migrated.execute(
+        "PRAGMA table_info(capacity_reservations)").fetchall()}
+    assert reservation_cols == {
+        "session_id", "tenant_id", "bytes", "state",
+        "created_at", "expires_at", "closed_at"}
+
+    db.run_migrations(migrated)  # 再次执行幂等不报错
+    migrated.close()
+
+
+def test_cancel_verification_session_invalidates_verification_tokens():
+    tenant_id = new_tenant()
+    resp = create_session_in_tenant(
+        tenant_id, 100, total_chunks=2, verification_required=True)
+    assert resp.status_code == 201, resp.text
+    sid = resp.json()["id"]
+    # 分片 0 进入待验收并领取验收令牌；分片 1 持有上传租约
+    lease_complete_awaiting(sid, 0)
+    vtoken = verification_lease().json()["verification_token"]
+    lease(sid, 1)
+
+    cancel = client.post(f"/sessions/{sid}/cancel")
+    assert cancel.status_code == 200, cancel.text
+    # 失效租约 = 1 个上传租约 + 1 个验收令牌
+    assert cancel.json()["invalidated_leases"] == 2
+
+    # 待验收分片已回到 pending（摘要清除），验收令牌已失效
+    st = client.get(f"/sessions/{sid}").json()
+    assert st["status"] == "cancelled"
+    assert st["awaiting_verification_chunks"] == []
+    chunk0 = st["chunks"][0]
+    assert chunk0["status"] == "pending"
+    assert chunk0["chunk_digest"] is None
+    assert decide(sid, 0, vtoken, "approve").status_code == 409
