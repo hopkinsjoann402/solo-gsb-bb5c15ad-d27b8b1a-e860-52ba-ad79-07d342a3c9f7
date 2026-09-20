@@ -48,6 +48,13 @@
   合并为携带 base/target 半开区间与对应摘要的区段，单处插入不会导致后续分片全部误报；
   会话不存在返回 404、未提交返回 409、任一清单超过 2000 项返回 422，
   相同清单返回覆盖整个清单的单个 equal 区段
+- 租户容量预留：创建会话必须提供 tenant_id、declared_bytes，服务端在同一写事务内
+  校验租户硬配额（used+reserved+本次 ≤ limit）并预留容量，并发创建经写锁串行化不超额；
+  预设有 TTL（缺省/上限可配），未提交会话到期后预留惰性释放（首次访问时标记 cancelled），
+  已提交则在 finalize 同一事务内把预留原子转为已用量。PUT/GET /tenants/{id}/quota
+  设置/查询配额，查询返回 quota/used/reserved/available，降低配额不得小于 used+reserved；
+  POST /sessions/{id}/cancel 仅允许 active 会话取消，原子释放预留并使全部在途租约
+  （含验收令牌）失效，重复取消幂等，已 finalized 不可取消
 """
 from __future__ import annotations
 
@@ -73,6 +80,7 @@ from .schemas import (
     BatchLeaseResponse,
     BlockedChunk,
     CHUNK_STATUS_AWAITING_VERIFICATION,
+    CancelSessionResponse,
     ChunkStatus,
     CompleteRequest,
     CompleteResponse,
@@ -87,6 +95,8 @@ from .schemas import (
     DISPATCH_REASON_DONE,
     DISPATCH_REASON_LEASED,
     DISPATCH_REASON_AWAITING_VERIFICATION,
+    DISPATCH_REASON_RESERVATION_EXPIRED,
+    DISPATCH_REASON_SESSION_CANCELLED,
     DISPATCH_REASON_SESSION_FINALIZED,
     DISPATCH_REASON_SESSION_FULL,
     DISPATCH_REASON_SESSION_NOT_FOUND,
@@ -115,11 +125,16 @@ from .schemas import (
     ReopenResponse,
     RevokeDeliveryTicketRequest,
     RevokeDeliveryTicketResponse,
+    SESSION_STATUS_ACTIVE,
+    SESSION_STATUS_CANCELLED,
+    SESSION_STATUS_FINALIZED,
     SessionResponse,
     SessionStatusResponse,
+    SetTenantQuotaRequest,
     TICKET_STATUS_ACTIVE,
     TICKET_STATUS_CONSUMED,
     TICKET_STATUS_REVOKED,
+    TenantQuotaResponse,
     VERIFICATION_DECISION_APPROVE,
     VERIFICATION_DECISION_REJECT,
     VerificationDecideRequest,
@@ -139,6 +154,12 @@ MAX_VERIFICATION_TTL_SECONDS = int(
 )
 DEFAULT_BASE_RETRY_SECONDS = int(os.environ.get("DEFAULT_BASE_RETRY_SECONDS", "5"))
 DEFAULT_MAX_RETRY_SECONDS = int(os.environ.get("DEFAULT_MAX_RETRY_SECONDS", "300"))
+DEFAULT_RESERVATION_TTL_SECONDS = int(
+    os.environ.get("DEFAULT_RESERVATION_TTL_SECONDS", str(24 * 3600))
+)
+MAX_RESERVATION_TTL_SECONDS = int(
+    os.environ.get("MAX_RESERVATION_TTL_SECONDS", str(7 * 24 * 3600))
+)
 
 
 def utcnow() -> datetime:
@@ -180,6 +201,100 @@ def get_chunk_or_404(session_id: str, chunk_index: int):
     if row is None:
         raise HTTPException(status_code=404, detail="chunk not found")
     return row
+
+
+# ---------------------------------------------------------------- 租户容量账务
+
+def get_tenant_or_404(tenant_id: str):
+    row = get_conn().execute(
+        "SELECT * FROM tenants WHERE tenant_id = ?", (tenant_id,)
+    ).fetchone()
+    if row is None:
+        raise HTTPException(status_code=404, detail="tenant not found")
+    return row
+
+
+def reservation_expired(session, now: datetime) -> bool:
+    """active 会话的容量预留是否已到期：到期时间为空（旧库行）视为不超时；
+    finalized/cancelled 会话返回 False（预留已不在预留口径内）。"""
+    if session["status"] != SESSION_STATUS_ACTIVE:
+        return False
+    expires_at = session["reservation_expires_at"]
+    return expires_at is not None and parse_ts(expires_at) <= now
+
+
+def tenant_used_bytes(tenant_id: str) -> int:
+    """已用量：全部 finalized 会话 declared_bytes 之和（提交时预留原子转为已用量）。"""
+    return get_conn().execute(
+        "SELECT COALESCE(SUM(declared_bytes), 0) AS n FROM sessions"
+        " WHERE tenant_id = ? AND status = ?",
+        (tenant_id, SESSION_STATUS_FINALIZED),
+    ).fetchone()["n"]
+
+
+def tenant_reserved_bytes(tenant_id: str, now_iso: str) -> int:
+    """预留量：全部未到期 active 会话 declared_bytes 之和。
+
+    到期预留采用惰性释放口径：行保留在 sessions 表中（审计可查），但不计入预留；
+    首次对该会话的写操作会将其原子标记为 cancelled。聚合在同一 DB_LOCK 临界区内，
+    与并发创建/提交/取消互斥，保证并发预留不会超额。
+    """
+    return get_conn().execute(
+        "SELECT COALESCE(SUM(declared_bytes), 0) AS n FROM sessions"
+        " WHERE tenant_id = ? AND status = ?"
+        " AND reservation_expires_at IS NOT NULL AND reservation_expires_at > ?",
+        (tenant_id, SESSION_STATUS_ACTIVE, now_iso),
+    ).fetchone()["n"]
+
+
+def tenant_active_session_count(tenant_id: str, now_iso: str) -> int:
+    """未取消、未到期的 active 会话数（仅观测用）。"""
+    return get_conn().execute(
+        "SELECT COUNT(*) AS n FROM sessions"
+        " WHERE tenant_id = ? AND status = ?"
+        " AND reservation_expires_at IS NOT NULL AND reservation_expires_at > ?",
+        (tenant_id, SESSION_STATUS_ACTIVE, now_iso),
+    ).fetchone()["n"]
+
+
+def expire_session_if_due(session, now: datetime):
+    """临界区内调用：active 会话预留到期时原子标记为 cancelled 并清除在途租约，
+    返回标记后重新读取的会话行；未到期或已终结则原样返回。与取消同一套清理动作，
+    保证到期后任何租约令牌立即失效。"""
+    if not reservation_expired(session, now):
+        return session
+    _cancel_session_locked(session["id"], now)
+    return get_conn().execute(
+        "SELECT * FROM sessions WHERE id = ?", (session["id"],)
+    ).fetchone()
+
+
+def _cancel_session_locked(session_id: str, now: datetime) -> None:
+    """临界区内调用：取消清理（不做状态校验）——会话置 cancelled，在途上传租约
+    与验收令牌全部失效。leased 分片回 pending 清租约；待验收分片按 reject 同口径
+    清除摘要/完成时间后回 pending（failure_count 保留）；completed 分片的摘要保留
+    作只读审计。"""
+    conn = get_conn()
+    conn.execute(
+        "UPDATE chunks SET status = 'pending', lease_token = NULL,"
+        " lease_expires_at = NULL"
+        " WHERE session_id = ? AND status = 'leased'",
+        (session_id,),
+    )
+    conn.execute(
+        "UPDATE chunks SET status = 'pending', lease_token = NULL,"
+        " lease_expires_at = NULL, chunk_digest = NULL, completed_at = NULL,"
+        " backoff_until = NULL"
+        " WHERE session_id = ? AND status = ?",
+        (session_id, CHUNK_STATUS_AWAITING_VERIFICATION),
+    )
+    conn.execute(
+        "DELETE FROM verification_leases WHERE session_id = ?", (session_id,)
+    )
+    conn.execute(
+        "UPDATE sessions SET status = ?, cancelled_at = ? WHERE id = ?",
+        (SESSION_STATUS_CANCELLED, now.isoformat(), session_id),
+    )
 
 
 def lease_valid(chunk, now: datetime) -> bool:
@@ -435,22 +550,50 @@ def dispatch_session_state(session_id: str, now: datetime):
     status_code=201,
     response_model=SessionResponse,
     tags=["sessions"],
-    summary="创建上传会话",
+    summary="创建上传会话（必填 tenant_id/declared_bytes，原子校验租户硬配额并预留容量）",
+    responses={
+        404: {"description": "租户不存在（尚未通过 PUT /tenants/{tenant_id}/quota 设置配额）"},
+        409: {"description": "租户剩余容量不足（响应体带 quota_bytes/used_bytes/"
+                             "reserved_bytes/requested_bytes/available_bytes）"},
+    },
 )
 def create_session(req: CreateSessionRequest):
     now = utcnow()
+    now_iso = now.isoformat()
     session_id = uuid.uuid4().hex
     deps = req.dependencies or {}
+    ttl = DEFAULT_RESERVATION_TTL_SECONDS
+    if req.reservation_ttl_seconds is not None:
+        ttl = min(req.reservation_ttl_seconds, MAX_RESERVATION_TTL_SECONDS)
+    reservation_expires_at = now + timedelta(seconds=ttl)
     with DB_LOCK:
         conn = get_conn()
+        tenant = get_tenant_or_404(req.tenant_id)
+        # 硬配额校验与预留写入在同一写事务：并发创建经 DB_LOCK 串行化，
+        # 每个请求都以提交后的最新聚合值判定，不可能超额预留
+        used = tenant_used_bytes(req.tenant_id)
+        reserved = tenant_reserved_bytes(req.tenant_id, now_iso)
+        available = tenant["quota_bytes"] - used - reserved
+        if req.declared_bytes > available:
+            return conflict(
+                "tenant quota exceeded",
+                quota_bytes=tenant["quota_bytes"],
+                used_bytes=used,
+                reserved_bytes=reserved,
+                requested_bytes=req.declared_bytes,
+                available_bytes=max(0, available),
+            )
         conn.execute(
             "INSERT INTO sessions (id, total_chunks, file_digest, digest_algorithm, status,"
             " max_active_leases, base_retry_seconds, max_retry_seconds,"
-            " verification_required, created_at)"
-            " VALUES (?, ?, ?, ?, 'active', ?, ?, ?, ?, ?)",
+            " verification_required, tenant_id, declared_bytes, reservation_expires_at,"
+            " created_at)"
+            " VALUES (?, ?, ?, ?, 'active', ?, ?, ?, ?, ?, ?, ?, ?)",
             (session_id, req.total_chunks, req.file_digest, req.digest_algorithm,
              req.max_active_leases, req.base_retry_seconds, req.max_retry_seconds,
-             1 if req.verification_required else 0, now.isoformat()),
+             1 if req.verification_required else 0,
+             req.tenant_id, req.declared_bytes, reservation_expires_at.isoformat(),
+             now_iso),
         )
         conn.executemany(
             "INSERT INTO chunks (session_id, chunk_index) VALUES (?, ?)",
@@ -467,6 +610,9 @@ def create_session(req: CreateSessionRequest):
         file_digest=req.file_digest,
         digest_algorithm=req.digest_algorithm,
         status="active",
+        tenant_id=req.tenant_id,
+        declared_bytes=req.declared_bytes,
+        reservation_expires_at=reservation_expires_at,
         source_session_id=None,
         max_active_leases=req.max_active_leases,
         base_retry_seconds=req.base_retry_seconds,
@@ -543,6 +689,16 @@ def get_session_status(session_id: str):
         missing_chunks=missing,
         file_digest=session["file_digest"],
         digest_algorithm=session["digest_algorithm"],
+        tenant_id=session["tenant_id"],
+        declared_bytes=session["declared_bytes"] or 0,
+        reservation_expires_at=(
+            parse_ts(session["reservation_expires_at"])
+            if session["reservation_expires_at"] else None
+        ),
+        reservation_expired=reservation_expired(session, now),
+        cancelled_at=(
+            parse_ts(session["cancelled_at"]) if session["cancelled_at"] else None
+        ),
         source_session_id=session["source_session_id"],
         revision=session["revision"],
         max_active_leases=session["max_active_leases"],
@@ -569,6 +725,7 @@ def build_fork_response(
     session,
     reuse: list[int],
     created_at: datetime,
+    reservation_expires_at: datetime,
     idempotent_replay: bool,
 ) -> ForkSessionResponse:
     reuse_set = set(reuse)
@@ -580,6 +737,9 @@ def build_fork_response(
         file_digest=session["file_digest"],
         digest_algorithm=session["digest_algorithm"],
         status="active",
+        tenant_id=session["tenant_id"],
+        declared_bytes=session["declared_bytes"] or 0,
+        reservation_expires_at=reservation_expires_at,
         revision=0,
         reused_chunks=reuse,
         pending_chunks=[i for i in range(session["total_chunks"]) if i not in reuse_set],
@@ -649,12 +809,18 @@ def fork_session(session_id: str, req: ForkSessionRequest):
                     session=new_session,
                     reuse=reuse,
                     created_at=parse_ts(existing["created_at"]),
+                    reservation_expires_at=parse_ts(
+                        new_session["reservation_expires_at"]),
                     idempotent_replay=True,
                 ).model_dump(mode="json"),
             )
 
-        if session["status"] == "finalized":
+        # 预留到期的 active 会话在此惰性转为 cancelled；已终结会话均不可再分支
+        session = expire_session_if_due(session, now)
+        if session["status"] == SESSION_STATUS_FINALIZED:
             raise HTTPException(status_code=409, detail="session already finalized")
+        if session["status"] == SESSION_STATUS_CANCELLED:
+            raise HTTPException(status_code=409, detail="session is cancelled")
         if session["revision"] != req.expected_revision:
             return conflict(
                 "revision mismatch",
@@ -686,17 +852,39 @@ def fork_session(session_id: str, req: ForkSessionRequest):
                 missing_prerequisites=missing_prerequisites,
             )
 
+        # fork 产生的新会话归属源租户并复制 declared_bytes：按一笔全新预留重新校验
+        # 硬配额（TTL 取服务端默认），与创建接口同一写事务口径，并发不超额
+        now_iso = now.isoformat()
+        tenant = get_tenant_or_404(session["tenant_id"])
+        declared_bytes = session["declared_bytes"] or 0
+        used = tenant_used_bytes(session["tenant_id"])
+        reserved = tenant_reserved_bytes(session["tenant_id"], now_iso)
+        available = tenant["quota_bytes"] - used - reserved
+        if declared_bytes > available:
+            return conflict(
+                "tenant quota exceeded",
+                quota_bytes=tenant["quota_bytes"],
+                used_bytes=used,
+                reserved_bytes=reserved,
+                requested_bytes=declared_bytes,
+                available_bytes=max(0, available),
+            )
+        reservation_expires_at = now + timedelta(
+            seconds=DEFAULT_RESERVATION_TTL_SECONDS)
+
         # 全部校验先于写入：以下任一失败都不会发生，整个复制在同一事务/临界区内完成
         new_id = uuid.uuid4().hex
         conn.execute(
             "INSERT INTO sessions (id, total_chunks, file_digest, digest_algorithm, status,"
             " max_active_leases, base_retry_seconds, max_retry_seconds, revision,"
-            " source_session_id, verification_required, created_at)"
-            " VALUES (?, ?, ?, ?, 'active', ?, ?, ?, 0, ?, ?, ?)",
+            " source_session_id, verification_required, tenant_id, declared_bytes,"
+            " reservation_expires_at, created_at)"
+            " VALUES (?, ?, ?, ?, 'active', ?, ?, ?, 0, ?, ?, ?, ?, ?, ?)",
             (new_id, session["total_chunks"], session["file_digest"],
              session["digest_algorithm"], session["max_active_leases"],
              session["base_retry_seconds"], session["max_retry_seconds"],
-             session_id, session["verification_required"], now.isoformat()),
+             session_id, session["verification_required"], session["tenant_id"],
+             declared_bytes, reservation_expires_at.isoformat(), now_iso),
         )
         # 复用分片：复制摘要与完成时间为 completed；其余默认 pending。
         # 不复制 lease_token / lease_expires_at / backoff_until / failure_count
@@ -739,6 +927,7 @@ def fork_session(session_id: str, req: ForkSessionRequest):
         session=session,
         reuse=reuse,
         created_at=now,
+        reservation_expires_at=reservation_expires_at,
         idempotent_replay=False,
     )
 
@@ -821,8 +1010,13 @@ def claim_lease(
     now = utcnow()
     with DB_LOCK:
         session = get_session_or_404(session_id)
-        if session["status"] == "finalized":
+        # 预留到期的 active 会话惰性转为 cancelled，随后与显式取消一致拒绝一切写入
+        session = expire_session_if_due(session, now)
+        if session["status"] == SESSION_STATUS_FINALIZED:
             raise HTTPException(status_code=409, detail="session already finalized")
+        if session["status"] == SESSION_STATUS_CANCELLED:
+            raise HTTPException(
+                status_code=409, detail="session is cancelled or reservation expired")
         chunk = get_chunk_or_404(session_id, chunk_index)
 
         if chunk["status"] == "completed":
@@ -893,8 +1087,12 @@ def claim_leases_batch(session_id: str, req: BatchLeaseRequest):
     now = utcnow()
     with DB_LOCK:
         session = get_session_or_404(session_id)
-        if session["status"] == "finalized":
+        session = expire_session_if_due(session, now)
+        if session["status"] == SESSION_STATUS_FINALIZED:
             raise HTTPException(status_code=409, detail="session already finalized")
+        if session["status"] == SESSION_STATUS_CANCELLED:
+            raise HTTPException(
+                status_code=409, detail="session is cancelled or reservation expired")
 
         # 资格计算与写入均在 DB_LOCK 临界区内：其它领取请求无法穿插看到中间状态
         ready, blocked = claimable_chunks(session_id, now)
@@ -1012,11 +1210,29 @@ def dispatch_lease(req: DispatchLeaseRequest):
                 ))
                 continue
 
-            if session["status"] == "finalized":
+            if session["status"] == SESSION_STATUS_FINALIZED:
                 unavailable.append(DispatchUnavailableSession(
                     session_id=sid,
                     reason=DISPATCH_REASON_SESSION_FINALIZED,
                     detail="session already finalized",
+                ))
+                continue
+
+            # 预留到期的 active 会话在本临界区内惰性转为 cancelled；
+            # 取消与到期都是终态，不携带 next_retry_at（不会自行恢复）
+            if reservation_expired(session, now):
+                _cancel_session_locked(sid, now)
+                unavailable.append(DispatchUnavailableSession(
+                    session_id=sid,
+                    reason=DISPATCH_REASON_RESERVATION_EXPIRED,
+                    detail="session reservation expired and was released",
+                ))
+                continue
+            if session["status"] == SESSION_STATUS_CANCELLED:
+                unavailable.append(DispatchUnavailableSession(
+                    session_id=sid,
+                    reason=DISPATCH_REASON_SESSION_CANCELLED,
+                    detail="session is cancelled",
                 ))
                 continue
 
@@ -1129,7 +1345,9 @@ def dispatch_lease(req: DispatchLeaseRequest):
                 entry.blocked = blocked
             unavailable.append(entry)
 
-        # 全部候选均不可发放：本路径无任何写入，游标保持不变
+        # 全部候选均不可发放：本路径无成功发放，游标保持不变；
+        # 若扫描中惰性取消了到期会话，需要提交该状态变更
+        conn.commit()
 
     return DispatchLeaseResponse(
         queue_key=req.queue_key,
@@ -1162,6 +1380,13 @@ def complete_chunk(session_id: str, chunk_index: int, req: CompleteRequest):
                 detail="chunk_digest must be 64 lowercase hex characters "
                        "for sha256-merkle-v1 sessions",
             )
+
+        # 预留到期的 active 会话惰性取消；已取消/到期会话一律拒绝写入
+        # （含幂等重放：会话终结后其分片清单不再有任何合法用途）
+        session = expire_session_if_due(session, now)
+        if session["status"] == SESSION_STATUS_CANCELLED:
+            raise HTTPException(
+                status_code=409, detail="session is cancelled or reservation expired")
 
         if chunk["status"] in ("completed", CHUNK_STATUS_AWAITING_VERIFICATION):
             # 幂等重放：同一租约令牌 + 同一摘要 => 返回首次完成结果（状态为当前所处状态）
@@ -1228,6 +1453,10 @@ def fail_chunk(session_id: str, chunk_index: int, req: FailRequest):
         session = get_session_or_404(session_id)
         chunk = get_chunk_or_404(session_id, chunk_index)
 
+        session = expire_session_if_due(session, now)
+        if session["status"] == SESSION_STATUS_CANCELLED:
+            raise HTTPException(
+                status_code=409, detail="session is cancelled or reservation expired")
         if chunk["status"] == "completed":
             raise HTTPException(status_code=409, detail="chunk already completed")
         if chunk["status"] == CHUNK_STATUS_AWAITING_VERIFICATION:
@@ -1283,6 +1512,10 @@ def reopen_chunk(session_id: str, chunk_index: int, req: ReopenRequest):
         session = get_session_or_404(session_id)
         chunk = get_chunk_or_404(session_id, chunk_index)
 
+        session = expire_session_if_due(session, utcnow())
+        if session["status"] == SESSION_STATUS_CANCELLED:
+            raise HTTPException(
+                status_code=409, detail="session is cancelled or reservation expired")
         if session["status"] == "finalized":
             raise HTTPException(status_code=409, detail="session already finalized")
         if chunk["status"] == CHUNK_STATUS_AWAITING_VERIFICATION:
@@ -1340,7 +1573,14 @@ def reopen_chunk(session_id: str, chunk_index: int, req: ReopenRequest):
 )
 def finalize_session(session_id: str):
     with DB_LOCK:
+        now = utcnow()
         session = get_session_or_404(session_id)
+        # 预留到期的 active 会话在此惰性取消，随后与显式取消一致拒绝提交；
+        # 取消/到期均不退回可提交状态（预留已释放，须重新创建会话）
+        session = expire_session_if_due(session, now)
+        if session["status"] == SESSION_STATUS_CANCELLED:
+            raise HTTPException(
+                status_code=409, detail="session is cancelled or reservation expired")
         rows = get_conn().execute(
             "SELECT * FROM chunks WHERE session_id = ? ORDER BY chunk_index",
             (session_id,),
@@ -1357,10 +1597,12 @@ def finalize_session(session_id: str):
             if not hmac.compare_digest(computed, session["file_digest"]):
                 return conflict("file digest mismatch", computed_digest=computed)
 
-        now = utcnow()
         finalized_at = parse_ts(session["finalized_at"]) if session["finalized_at"] else None
         if session["status"] != "finalized":
             finalized_at = now
+            # 原子提交：status active -> finalized 即把该会话 declared_bytes
+            # 从租户 reserved 聚合移到 used 聚合（均为按状态实时 SUM，无独立计数器），
+            # 预留额原子转为已用量，同一事务内无中间态
             get_conn().execute(
                 "UPDATE sessions SET status = 'finalized', finalized_at = ? WHERE id = ?",
                 (finalized_at.isoformat(), session_id),
@@ -1384,6 +1626,134 @@ def finalize_session(session_id: str):
         ],
         finalized_at=finalized_at,
     )
+
+
+# ---------------------------------------------------------------- 取消与租户配额
+
+@app.post(
+    "/sessions/{session_id}/cancel",
+    response_model=CancelSessionResponse,
+    tags=["sessions"],
+    summary="取消 active 会话：原子释放容量预留并使现有租约全部失效（重复取消幂等）",
+    responses={
+        404: {"description": "会话不存在"},
+        409: {"description": "会话已 finalized（已用量不可通过取消释放）"},
+    },
+)
+def cancel_session(session_id: str):
+    now = utcnow()
+    now_iso = now.isoformat()
+    with DB_LOCK:
+        conn = get_conn()
+        session = get_session_or_404(session_id)
+
+        if session["status"] == SESSION_STATUS_FINALIZED:
+            raise HTTPException(status_code=409, detail="session already finalized")
+
+        if session["status"] == SESSION_STATUS_CANCELLED:
+            # 幂等：重复取消（含预留到期后被服务端惰性标记的会话）返回首次结果，
+            # 不再释放任何容量
+            return CancelSessionResponse(
+                session_id=session_id,
+                status=SESSION_STATUS_CANCELLED,
+                released_bytes=0,
+                cancelled_at=parse_ts(session["cancelled_at"]),
+                idempotent_replay=True,
+            )
+
+        # active：预留可能已到期。未到期则本次取消释放 declared_bytes；
+        # 已到期则预留早已不计入租户 reserved，仅做终态标记。两种情况下在途租约
+        # 都必须立即失效，因此统一走取消清理。
+        is_live = not reservation_expired(session, now)
+        released_bytes = (session["declared_bytes"] or 0) if is_live else 0
+        _cancel_session_locked(session_id, now)
+        conn.commit()
+
+    return CancelSessionResponse(
+        session_id=session_id,
+        status=SESSION_STATUS_CANCELLED,
+        released_bytes=released_bytes,
+        cancelled_at=now,
+        idempotent_replay=False,
+    )
+
+
+def build_tenant_quota_response(tenant, now_iso: str) -> TenantQuotaResponse:
+    """临界区内调用：组装配额视图 limit/used/reserved/available（均为字节）。"""
+    tenant_id = tenant["tenant_id"]
+    used = tenant_used_bytes(tenant_id)
+    reserved = tenant_reserved_bytes(tenant_id, now_iso)
+    return TenantQuotaResponse(
+        tenant_id=tenant_id,
+        quota_bytes=tenant["quota_bytes"],
+        used_bytes=used,
+        reserved_bytes=reserved,
+        available_bytes=tenant["quota_bytes"] - used - reserved,
+        active_session_count=tenant_active_session_count(tenant_id, now_iso),
+        created_at=parse_ts(tenant["created_at"]),
+        updated_at=parse_ts(tenant["updated_at"]),
+    )
+
+
+@app.put(
+    "/tenants/{tenant_id}/quota",
+    response_model=TenantQuotaResponse,
+    tags=["tenants"],
+    summary="设置（UPSERT）租户硬配额；降低时不得小于 used+reserved",
+    responses={
+        409: {"description": "降低后的配额小于当前 used_bytes + reserved_bytes"
+                             "（响应体带当前账务与最小可设值）"},
+    },
+)
+def set_tenant_quota(tenant_id: str, req: SetTenantQuotaRequest):
+    now = utcnow()
+    now_iso = now.isoformat()
+    with DB_LOCK:
+        conn = get_conn()
+        tenant = conn.execute(
+            "SELECT * FROM tenants WHERE tenant_id = ?", (tenant_id,)
+        ).fetchone()
+        # 账务聚合在同一写事务读取：并发创建/提交/取消经 DB_LOCK 串行化
+        used = tenant_used_bytes(tenant_id)
+        reserved = tenant_reserved_bytes(tenant_id, now_iso)
+        floor = used + reserved
+        if req.quota_bytes < floor:
+            return conflict(
+                "quota_bytes cannot be less than used_bytes + reserved_bytes",
+                quota_bytes=req.quota_bytes,
+                used_bytes=used,
+                reserved_bytes=reserved,
+                minimum_quota_bytes=floor,
+            )
+        if tenant is None:
+            conn.execute(
+                "INSERT INTO tenants (tenant_id, quota_bytes, created_at, updated_at)"
+                " VALUES (?, ?, ?, ?)",
+                (tenant_id, req.quota_bytes, now_iso, now_iso),
+            )
+        else:
+            conn.execute(
+                "UPDATE tenants SET quota_bytes = ?, updated_at = ? WHERE tenant_id = ?",
+                (req.quota_bytes, now_iso, tenant_id),
+            )
+        conn.commit()
+        tenant = conn.execute(
+            "SELECT * FROM tenants WHERE tenant_id = ?", (tenant_id,)
+        ).fetchone()
+        return build_tenant_quota_response(tenant, now_iso)
+
+
+@app.get(
+    "/tenants/{tenant_id}/quota",
+    response_model=TenantQuotaResponse,
+    tags=["tenants"],
+    summary="查询租户配额与实时账务（quota/used/reserved/available，字节）",
+    responses={404: {"description": "租户不存在（尚未设置过配额）"}},
+)
+def get_tenant_quota(tenant_id: str):
+    with DB_LOCK:
+        tenant = get_tenant_or_404(tenant_id)
+        return build_tenant_quota_response(tenant, utcnow().isoformat())
 
 
 # ---------------------------------------------------------------- 交付凭证
@@ -1809,10 +2179,12 @@ def lease_verification(req: Optional[VerificationLeaseRequest] = Body(default=No
             " LEFT JOIN verification_leases v"
             "   ON v.session_id = c.session_id AND v.chunk_index = c.chunk_index"
             " WHERE c.status = ? AND s.verification_required = 1"
+            " AND s.status = 'active'"
+            " AND (s.reservation_expires_at IS NULL OR s.reservation_expires_at > ?)"
             " AND (v.expires_at IS NULL OR v.expires_at <= ?)"
             " ORDER BY c.completed_at, c.session_id, c.chunk_index"
             " LIMIT 1",
-            (CHUNK_STATUS_AWAITING_VERIFICATION, now_iso),
+            (CHUNK_STATUS_AWAITING_VERIFICATION, now_iso, now_iso),
         ).fetchone()
         if row is None:
             raise HTTPException(
@@ -1875,8 +2247,14 @@ def decide_verification(session_id: str, chunk_index: int, req: VerificationDeci
     token_hash = hash_verification_token(req.verification_token)
     with DB_LOCK:
         conn = get_conn()
-        get_session_or_404(session_id)
+        session = get_session_or_404(session_id)
         chunk = get_chunk_or_404(session_id, chunk_index)
+
+        # 预留到期惰性取消；已取消/到期会话的待验收分片不可再被验收
+        session = expire_session_if_due(session, now)
+        if session["status"] == SESSION_STATUS_CANCELLED:
+            raise HTTPException(
+                status_code=409, detail="session is cancelled or reservation expired")
 
         decision_row = conn.execute(
             "SELECT * FROM verification_decisions WHERE token_hash = ?",
@@ -1990,4 +2368,6 @@ def root():
         "max_verification_ttl_seconds": MAX_VERIFICATION_TTL_SECONDS,
         "default_base_retry_seconds": DEFAULT_BASE_RETRY_SECONDS,
         "default_max_retry_seconds": DEFAULT_MAX_RETRY_SECONDS,
+        "default_reservation_ttl_seconds": DEFAULT_RESERVATION_TTL_SECONDS,
+        "max_reservation_ttl_seconds": MAX_RESERVATION_TTL_SECONDS,
     }

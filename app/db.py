@@ -19,15 +19,32 @@ CREATE TABLE IF NOT EXISTS sessions (
     total_chunks           INTEGER NOT NULL,
     file_digest            TEXT NOT NULL,
     digest_algorithm       TEXT NOT NULL DEFAULT 'sha256',
-    status                 TEXT NOT NULL DEFAULT 'active',   -- active | finalized
+    status                 TEXT NOT NULL DEFAULT 'active',   -- active | finalized | cancelled
     max_active_leases      INTEGER,                          -- 会话级并发租约上限；NULL 表示不限
     base_retry_seconds     INTEGER NOT NULL DEFAULT 5,       -- 失败退避基数（第 1 次失败冷却秒数）
     max_retry_seconds      INTEGER NOT NULL DEFAULT 300,     -- 失败退避冷却上限（秒）
     revision               INTEGER NOT NULL DEFAULT 0,       -- 修订号：每次成功 reopen 回退递增 1
     source_session_id      TEXT,                             -- fork 来源会话；NULL 表示原生会话
     verification_required  INTEGER NOT NULL DEFAULT 0,       -- 分片验收队列：1=启用，完成先进入待验收
+    tenant_id              TEXT NOT NULL,                    -- 所属租户；旧库迁移行可能为 NULL
+    declared_bytes         INTEGER NOT NULL DEFAULT 0,       -- 创建会话时声明并预留的字节数
+    reservation_expires_at TEXT,                             -- 预留到期时间；NULL 表示不超时（旧库行）
+    cancelled_at           TEXT,                             -- 取消时间；仅 status='cancelled' 时非空
     created_at             TEXT NOT NULL,
     finalized_at           TEXT
+);
+
+-- 租户容量账务按 (tenant_id, status) 聚合：used 取 finalized 会话、reserved 取未到期
+-- active 会话（同一写事务内 SUM，配合 DB_LOCK 保证并发创建不超额）
+CREATE INDEX IF NOT EXISTS idx_sessions_tenant_state
+    ON sessions(tenant_id, status, reservation_expires_at);
+
+-- 租户硬配额表：limit=quota_bytes；used/reserved 由 sessions 表实时聚合，不另存计数器
+CREATE TABLE IF NOT EXISTS tenants (
+    tenant_id    TEXT PRIMARY KEY,
+    quota_bytes  INTEGER NOT NULL,                          -- 硬配额（字节）；不得降到 used+reserved 以下
+    created_at   TEXT NOT NULL,
+    updated_at   TEXT NOT NULL
 );
 
 -- 进度分支幂等记录：(源会话, request_id) 唯一，重放返回首次创建的新会话
@@ -263,6 +280,41 @@ CREATE TABLE verification_decisions (
     decision      TEXT NOT NULL,
     decided_at    TEXT NOT NULL,
     FOREIGN KEY (session_id, chunk_index) REFERENCES chunks(session_id, chunk_index)
+)
+        """,
+    ),
+    # 0013: 租户容量预留：会话行补租户、声明字节数、预留到期时间与取消时间。
+    # tenant_id 在新库为 NOT NULL；旧库既有行无租户归属，迁移列保持可空（不参与账务聚合）。
+    (
+        "column",
+        "sessions.tenant_id",
+        "ALTER TABLE sessions ADD COLUMN tenant_id TEXT",
+    ),
+    (
+        "column",
+        "sessions.declared_bytes",
+        "ALTER TABLE sessions ADD COLUMN declared_bytes INTEGER NOT NULL DEFAULT 0",
+    ),
+    (
+        "column",
+        "sessions.reservation_expires_at",
+        "ALTER TABLE sessions ADD COLUMN reservation_expires_at TEXT",
+    ),
+    (
+        "column",
+        "sessions.cancelled_at",
+        "ALTER TABLE sessions ADD COLUMN cancelled_at TEXT",
+    ),
+    # 0014: 租户硬配额表；旧库直接按当前定义新建，首次 PUT /tenants/{id}/quota 时惰性写入
+    (
+        "table",
+        "tenants",
+        """
+CREATE TABLE tenants (
+    tenant_id    TEXT PRIMARY KEY,
+    quota_bytes  INTEGER NOT NULL,
+    created_at   TEXT NOT NULL,
+    updated_at   TEXT NOT NULL
 )
         """,
     ),

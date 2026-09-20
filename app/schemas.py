@@ -14,6 +14,15 @@ from pydantic import BaseModel, Field, model_validator
 MERKLE_DIGEST_ALGORITHM = "sha256-merkle-v1"
 _MERKLE_DIGEST_RE = re.compile(r"[0-9a-f]{64}")
 
+# 会话状态：active（上传中，持有容量预留）| finalized（已提交，预留已转为已用量）
+#         | cancelled（已取消，预留已释放；预留到期后惰性进入该状态）
+SESSION_STATUS_ACTIVE = "active"
+SESSION_STATUS_FINALIZED = "finalized"
+SESSION_STATUS_CANCELLED = "cancelled"
+
+# 字节数上限：不超过 SQLite 有符号 64 位整数范围
+MAX_BYTES = 2 ** 63 - 1
+
 
 def is_valid_merkle_digest(value: str) -> bool:
     """sha256-merkle-v1 的摘要格式：恰好 64 位小写十六进制字符。"""
@@ -64,6 +73,17 @@ def validate_dependencies(
 
 class CreateSessionRequest(BaseModel):
     total_chunks: int = Field(ge=1, le=100_000, description="总分片数")
+    tenant_id: str = Field(
+        min_length=1, max_length=128,
+        description="租户标识：必填。容量预留计入该租户硬配额，未知租户返回 404")
+    declared_bytes: int = Field(
+        ge=0, le=MAX_BYTES,
+        description="本会话声明占用的字节数：必填。创建时在同一写事务内校验硬配额并原子预留，"
+                    "未提交会话到期或取消时释放，提交后原子转为租户已用量；允许 0")
+    reservation_ttl_seconds: Optional[int] = Field(
+        default=None, ge=1,
+        description="容量预留有效期（秒）：active 会话超过该时间未提交则预留自动释放，"
+                    "缺省取服务端默认值，超过服务端上限会被截断")
     file_digest: str = Field(
         min_length=1, max_length=256,
         description="期望的完整文件摘要；digest_algorithm 为 sha256-merkle-v1 时必须是"
@@ -126,6 +146,12 @@ class SessionResponse(BaseModel):
     file_digest: str
     digest_algorithm: str
     status: str
+    tenant_id: str = Field(description="所属租户 id")
+    declared_bytes: int = Field(description="创建时声明并预留的字节数")
+    reservation_expires_at: Optional[datetime] = Field(
+        default=None,
+        description="容量预留到期时间（UTC）：active 会话超过该时间未提交则预留自动释放；"
+                    "finalized/cancelled 后保留原始值供审计")
     source_session_id: Optional[str] = Field(
         default=None, description="fork 来源会话 id；原生会话为 null")
     max_active_leases: Optional[int] = Field(
@@ -136,6 +162,8 @@ class SessionResponse(BaseModel):
         default=False, description="是否启用分片验收队列；false 时完成上报直接转 completed")
     created_at: datetime
     finalized_at: Optional[datetime] = None
+    cancelled_at: Optional[datetime] = Field(
+        default=None, description="取消时间；仅 cancelled 会话非 null")
 
 
 class ForkSessionRequest(BaseModel):
@@ -258,6 +286,7 @@ class DispatchUnavailableSession(BaseModel):
         description="不可发放的候选会话 id；候选中存在无法识别的空值时可能为 null")
     reason: str = Field(
         description="不可发放原因：session_not_found / session_finalized / session_full /"
+                    " session_cancelled / reservation_expired /"
                     " chunks_blocked_by_dependencies / chunks_in_backoff / chunks_leased /"
                     " chunks_awaiting_verification / no_unfinished_chunks")
     detail: Optional[str] = Field(
@@ -364,6 +393,12 @@ class ForkSessionResponse(BaseModel):
     file_digest: str
     digest_algorithm: str
     status: str = Field(description="新会话状态：始终为 active")
+    tenant_id: str = Field(
+        description="新会话所属租户：与源会话相同；创建时按 declared_bytes 重新预留容量")
+    declared_bytes: int = Field(
+        description="从源会话复制的声明字节数：创建时作为新会话预留量参与租户配额校验")
+    reservation_expires_at: datetime = Field(
+        description="新会话的容量预留到期时间（取服务端默认 TTL，重放保持首次值）")
     revision: int = Field(description="新会话修订号：从 0 开始")
     reused_chunks: list[int] = Field(
         description="复制为 completed 的分片序号（升序去重，即请求中的 reuse_chunks）")
@@ -507,12 +542,22 @@ class ReadyResponse(BaseModel):
 
 class SessionStatusResponse(BaseModel):
     id: str
-    status: str
+    status: str  # active | finalized | cancelled
     total_chunks: int
     completed_chunks: int
     missing_chunks: list[int]
     file_digest: str
     digest_algorithm: str
+    tenant_id: str = Field(description="所属租户 id")
+    declared_bytes: int = Field(description="创建时声明并预留（提交后转为已用量）的字节数")
+    reservation_expires_at: Optional[datetime] = Field(
+        default=None, description="容量预留到期时间；null 表示不超时（旧库会话）")
+    reservation_expired: bool = Field(
+        default=False,
+        description="预留是否已到期：仅 active 会话可能为 true，此时预留已释放、"
+                    "会话不可再被领取/上报/提交，只能取消或被服务端惰性标记为 cancelled")
+    cancelled_at: Optional[datetime] = Field(
+        default=None, description="取消时间；仅 cancelled 会话非 null")
     source_session_id: Optional[str] = Field(
         default=None, description="fork 来源会话 id；原生会话为 null")
     revision: int = Field(
@@ -638,3 +683,48 @@ class ManifestDiffResponse(BaseModel):
     segments: list[ManifestDiffSegment] = Field(
         description="按清单顺序排列的合并区段：连续同类操作已合并；多解时固定优先删除再插入，"
                     "同一替换位置的 delete 区段总是排在 insert 区段之前")
+
+
+# ---------------------------------------------------------------- 租户容量预留与配额
+
+# 跨会话调度中被取消/预留到期会话的不可用原因（与既有原因并列）
+DISPATCH_REASON_SESSION_CANCELLED = "session_cancelled"
+DISPATCH_REASON_RESERVATION_EXPIRED = "reservation_expired"
+
+
+class SetTenantQuotaRequest(BaseModel):
+    quota_bytes: int = Field(
+        ge=0, le=MAX_BYTES,
+        description="租户硬配额（字节）：UPSERT；降低时不得小于当前 used_bytes + reserved_bytes，"
+                    "否则返回 409 且不修改；允许设为 0（无任何 active/finalized 会话时）")
+
+
+class TenantQuotaResponse(BaseModel):
+    tenant_id: str
+    quota_bytes: int = Field(description="硬配额（字节）")
+    used_bytes: int = Field(
+        description="已用量（字节）：全部 finalized 会话 declared_bytes 之和")
+    reserved_bytes: int = Field(
+        description="预留量（字节）：全部未到期 active 会话 declared_bytes 之和；"
+                    "已取消与已到期会话不占用")
+    available_bytes: int = Field(
+        description="当前可预留容量（字节）：quota_bytes - used_bytes - reserved_bytes，恒非负")
+    active_session_count: int = Field(
+        default=0,
+        description="未取消、未到期的 active 会话数（仅作观测，不参与容量判定）")
+    created_at: datetime
+    updated_at: datetime = Field(
+        description="配额最近一次设置的时间；首次创建时与 created_at 相同")
+
+
+class CancelSessionResponse(BaseModel):
+    session_id: str
+    status: str = Field(
+        description="取消后的会话状态：始终为 cancelled；重复取消幂等返回该值")
+    released_bytes: int = Field(
+        description="本次取消实际释放的预留字节数：active 未到期会话为 declared_bytes，"
+                    "已取消/预留已到期时为 0（finalized 会话不可取消）")
+    cancelled_at: datetime = Field(
+        description="会话首次取消时间：重复取消保持首次值")
+    idempotent_replay: bool = Field(
+        default=False, description="是否为重复取消（会话此前已是 cancelled）")
